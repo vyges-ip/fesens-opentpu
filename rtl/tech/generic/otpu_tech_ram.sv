@@ -1,0 +1,130 @@
+// The technology RAMs, behavioural (rtl/tech/generic): Verilator, yosys and the FPGA flows infer
+// them; rtl/tech/asic/otpu_tech_ram.sv has the same modules on SRAM macros. Every large memory of
+// the core goes through one of these, so a target's file list picks the cells
+// (docs/superpowers/specs/2026-10-10-multi-target-design.md, D4 and D5).
+//
+// All reads are synchronous and registered with an enable: rd holds while re (en) is low. A read
+// of the word written at the same edge returns the old word here (read-first); the macros do not
+// promise it (a 1R1W macro's same-address read is undefined), so a user must not depend on it
+// (otpu_tmem bypasses the write it would hit). STYLE is the FPGA's ram_style ("block",
+// "distributed" or "auto"); the macros ignore it. In simulation every word starts at 0, unless
+// ZERO is 0 (a user that loads the memory from its own initial block: their order is undefined).
+
+// One read port and one write port (simple dual-port).
+module otpu_ram_1r1w #(
+  parameter int    W     = 32,
+  parameter int    N     = 1024,
+  parameter string STYLE = "block",
+  parameter bit    ZERO  = 1'b1
+) (
+  input  logic                 clk,
+  input  logic                 we,
+  input  logic [$clog2(N)-1:0] wa,
+  input  logic [W-1:0]         wd,
+  input  logic                 re,
+  input  logic [$clog2(N)-1:0] ra,
+  output logic [W-1:0]         rd
+);
+  if (STYLE == "distributed") begin : g_lut
+    (* ram_style = "distributed" *) logic [W-1:0] mem [N];
+    always_ff @(posedge clk) begin
+      if (we) mem[wa] <= wd;
+      if (re) rd <= mem[ra];
+    end
+`ifndef SYNTHESIS
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
+`endif
+  end else if (STYLE == "auto") begin : g_auto
+    logic [W-1:0] mem [N];
+    always_ff @(posedge clk) begin
+      if (we) mem[wa] <= wd;
+      if (re) rd <= mem[ra];
+    end
+`ifndef SYNTHESIS
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
+`endif
+  end else begin : g_bram
+    (* ram_style = "block" *) logic [W-1:0] mem [N];
+    always_ff @(posedge clk) begin
+      if (we) mem[wa] <= wd;
+      if (re) rd <= mem[ra];
+    end
+`ifndef SYNTHESIS
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
+`endif
+  end
+endmodule
+
+// One read port and one write port with byte enables (wbe[k]: write byte k of wd).
+module otpu_ram_1r1w_be #(
+  parameter int    W     = 64,           // a multiple of 8
+  parameter int    N     = 1024,
+  parameter string STYLE = "block",
+  parameter bit    ZERO  = 1'b1
+) (
+  input  logic                 clk,
+  input  logic                 we,
+  input  logic [W/8-1:0]       wbe,
+  input  logic [$clog2(N)-1:0] wa,
+  input  logic [W-1:0]         wd,
+  input  logic                 re,
+  input  logic [$clog2(N)-1:0] ra,
+  output logic [W-1:0]         rd
+);
+  initial if (W % 8 != 0) $fatal(1, "otpu_ram_1r1w_be: W %0d is not a multiple of 8", W);
+  if (STYLE == "block") begin : g_bram
+    (* ram_style = "block" *) logic [W-1:0] mem [N];
+    always_ff @(posedge clk) begin
+      for (int k = 0; k < W / 8; k++) if (we && wbe[k]) mem[wa][8*k +: 8] <= wd[8*k +: 8];
+      if (re) rd <= mem[ra];
+    end
+`ifndef SYNTHESIS
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
+`endif
+  end else begin : g_auto
+    logic [W-1:0] mem [N];
+    always_ff @(posedge clk) begin
+      for (int k = 0; k < W / 8; k++) if (we && wbe[k]) mem[wa][8*k +: 8] <= wd[8*k +: 8];
+      if (re) rd <= mem[ra];
+    end
+`ifndef SYNTHESIS
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
+`endif
+  end
+endmodule
+
+// One port: a read or a write per cycle (en: the access, we: it is a write; a write does not
+// change rd).
+module otpu_ram_1rw #(
+  parameter int    W     = 32,
+  parameter int    N     = 1024,
+  parameter string STYLE = "block",
+  parameter bit    ZERO  = 1'b1
+) (
+  input  logic                 clk,
+  input  logic                 en,
+  input  logic                 we,
+  input  logic [$clog2(N)-1:0] a,
+  input  logic [W-1:0]         wd,
+  output logic [W-1:0]         rd
+);
+  if (STYLE == "block") begin : g_bram
+    (* ram_style = "block" *) logic [W-1:0] mem [N];
+    always_ff @(posedge clk) if (en) begin
+      if (we) mem[a] <= wd;
+      else rd <= mem[a];
+    end
+`ifndef SYNTHESIS
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
+`endif
+  end else begin : g_auto
+    logic [W-1:0] mem [N];
+    always_ff @(posedge clk) if (en) begin
+      if (we) mem[a] <= wd;
+      else rd <= mem[a];
+    end
+`ifndef SYNTHESIS
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
+`endif
+  end
+endmodule
