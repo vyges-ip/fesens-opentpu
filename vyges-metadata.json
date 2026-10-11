@@ -1,0 +1,127 @@
+{
+  "$schema": "https://vyges.com/schema/v1/vyges-metadata.schema.json",
+  "x-version": "1.0.0",
+  "name": "fesens-opentpu",
+  "version": "0.1.0",
+  "description": "LLM-inference accelerator block: a matrix unit (MXU), a vector unit (VPU), DMA between the slice DRAM and on-chip tensor memory, and an instruction sequencer, in SystemVerilog. The ASIC top (rtl/asic/otpu_asic_top.sv) is one slice and its collective unit with the slice's DRAM ports at the boundary (no memory controller or PHY inside). Upstream also ships an ISA, a bit-exact simulator, a kernel compiler and host software, and reports the design running int8 and 4-bit LLMs on a Kintex-7 PCIe card (self-reported, not verified by Vyges). The FPGA board glue (rtl/boards, generated LiteDRAM) is not mirrored. Mirror of FeSens/openTPU.",
+  "license": "Apache-2.0",
+  "maturity": "prototype",
+  "target": [
+    "asic",
+    "fpga"
+  ],
+  "design_type": [
+    "digital"
+  ],
+  "created": "2026-10-11T04:15:54Z",
+  "updated": "2026-10-11T04:15:54Z",
+  "source": {
+    "type": "git",
+    "url": "https://github.com/FeSens/openTPU",
+    "commit": "596d62fa8f0aa0592fed8860485e690c1226d602",
+    "ip_path": ".",
+    "private": false,
+    "containsEncryptedPayload": false,
+    "indexing": true,
+    "rtl_files": [
+      "rtl/asic",
+      "rtl/dma",
+      "rtl/mem",
+      "rtl/mxu",
+      "rtl/seq",
+      "rtl/shell",
+      "rtl/tech",
+      "rtl/top",
+      "rtl/vpu"
+    ]
+  },
+  "maintainers": [
+    {
+      "name": "FeSens",
+      "url": "https://github.com/FeSens",
+      "github": "FeSens"
+    },
+    {
+      "name": "Vyges",
+      "url": "https://vyges.com/contact",
+      "github": "vyges"
+    }
+  ],
+  "interfaces": [
+    {
+      "type": "clock",
+      "name": "clock",
+      "signals": [
+        {
+          "name": "clk",
+          "direction": "input",
+          "type": "clock",
+          "width": 1
+        }
+      ]
+    },
+    {
+      "type": "reset",
+      "name": "reset",
+      "signals": [
+        {
+          "name": "sys_rst",
+          "direction": "input",
+          "type": "reset",
+          "width": 1,
+          "active_level": "high"
+        },
+        {
+          "name": "rst",
+          "direction": "input",
+          "type": "reset",
+          "width": 1,
+          "active_level": "high"
+        }
+      ]
+    }
+  ],
+  "categories": [
+    {
+      "main_category": "Processing Cores",
+      "sub_category": "Deep Learning Accelerator"
+    }
+  ],
+  "keywords": [
+    "tpu",
+    "npu",
+    "accelerator",
+    "llm",
+    "inference",
+    "matrix-unit",
+    "systolic",
+    "vector-unit",
+    "int8",
+    "ai"
+  ],
+  "branding": {
+    "provider": "FeSens",
+    "display_name": "openTPU (FeSens)"
+  },
+  "test": {
+    "status": "pending",
+    "coverage": "none"
+  },
+  "trust": {
+    "verification_level": "unverified",
+    "tapeout_count": 0,
+    "fpga_validated": false,
+    "maintained": true,
+    "last_activity": "2026-10-11T04:15:54Z"
+  },
+  "meta": {
+    "template": {
+      "generator": "onboard_ip.py",
+      "template_version": "1.0.0",
+      "generated_at": "2026-10-11T04:15:54Z"
+    },
+    "schema": {
+      "version": "1.0.0"
+    }
+  }
+}

@@ -1,0 +1,35 @@
+schema_version: "vyges-upstream-v1"
+upstream:
+  type: "standalone"
+  repo: https://github.com/FeSens/openTPU
+  branch: main
+  commit: 596d62fa8f0aa0592fed8860485e690c1226d602
+  extracted_at: "2026-10-11T04:15:54Z"
+import:
+  rtl:
+    - path: "rtl/asic"
+      map_to: "rtl/asic"
+    - path: "rtl/dma"
+      map_to: "rtl/dma"
+    - path: "rtl/mem"
+      map_to: "rtl/mem"
+    - path: "rtl/mxu"
+      map_to: "rtl/mxu"
+    - path: "rtl/seq"
+      map_to: "rtl/seq"
+    - path: "rtl/shell"
+      map_to: "rtl/shell"
+    - path: "rtl/tech"
+      map_to: "rtl/tech"
+    - path: "rtl/top"
+      map_to: "rtl/top"
+    - path: "rtl/vpu"
+      map_to: "rtl/vpu"
+  license:
+    - path: "LICENSE"
+  readme:
+    - path: "README.md"
+license:
+  spdx: Apache-2.0
+  file: LICENSE
+metadata_locked: true
