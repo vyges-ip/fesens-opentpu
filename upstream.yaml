@@ -3,7 +3,7 @@ upstream:
   type: "standalone"
   repo: https://github.com/FeSens/openTPU
   branch: main
-  commit: 5b33323d4277aaf41959efb1d9a8e91436750fc5
+  commit: f237dab2f196855a59a083b1454786df8f01291f
   extracted_at: "2026-10-11T04:15:54Z"
 import:
   rtl:

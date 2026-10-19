@@ -2,13 +2,20 @@
 // VPU and TMEM. Units run concurrently. Shared resources are arbitrated every cycle:
 //   TMEM   each bank serves 3 reads + 1 write per cycle; units are granted all-or-nothing in
 //          the priority order DMA, COLL, VPU, MXU drain, QUANT (a unit that is not granted holds)
-//   DRAM B DMA first, then the MXU stream (read responses are routed back by tag)
-//   DRAM A the MXU scale stream (reads); QST writes have their own scalar write port (SW)
+//   DRAM B DMA first, then the MXU stream (read responses are routed back by tag); its outputs
+//          come from a register (b_req its valid bit) and its read data enters through one
+//   DRAM A the MXU scale stream (reads), its outputs from a register (a_req its valid bit); QST
+//          writes have their own scalar write port (SW), whose outputs come from a register
+//          (sw_req its valid bit)
 // The slice's DRAM sits outside (otpu_top) so that board wrappers can swap it. The DRAM may
 // refuse requests (a_rdy/b_rdy, which must not depend on this cycle's requests), return reads
 // after any latency (in order per port), and acknowledge writes late (wr_idle: none pending);
 // rd_idle: no read of the slice's in flight (a run stopped by the host, rst, leaves its reads
-// to come back after it).
+// to come back after it). A request in the SW, port A or port B register is in neither the units
+// nor the DRAM, and port B's read data is the slice's a cycle after its b_rvalid: every write the
+// slice gave is taken once wr_idle && !sw_req && !(b_req && b_we), and no read of the slice's is
+// in flight once rd_idle && !a_req && !(b_req && !b_we) and there was no b_rvalid the cycle
+// before (port A's requests are reads: a_we is 0).
 //
 // Loader: while the slice is held in reset (rst), ld_start copies ld_n instructions from DRAM
 // byte address ld_addr (chunk aligned) into IMEM, one chunk (D/32 instructions) per cycle.
@@ -39,16 +46,44 @@ module otpu_slice
   parameter int WIN        = 32,
   parameter int RPB        = 4,       // TMEM reads per bank per cycle
   parameter int WPB        = 2,       // TMEM writes per bank per cycle
-  parameter int MXU_IMPL   = 0,       // MXU dot product: 0 adder tree, 1 DSP cascade chains, 2 systolic
+  parameter int MXU_IMPL   = 2,       // MXU dot product: 2 systolic, the only one (docs/mxu_systolic.md)
   parameter int MXU_CL     = 16,      // cascade chain length
+  parameter int MXU_E      = 0,       // MXU epilogue lanes (0: MCOLS / 2; otpu_mxu E)
+  parameter int QUANT_XD   = 1024,    // quantizer row buffer chunks (0: two passes over TMEM; otpu_quant XD)
   parameter int VPU_CL     = (LANES >= 8) ? LANES / 4 : 1,  // VPU lanes with the composite functions
   parameter int ULANES     = LANES,   // TMEM lanes of the MXU and the quantizer (<= LANES)
   parameter int PQ_WIN     = 64,      // cycles per P/Q counter window (+bucket= in simulation)
   parameter bit HAS_DSTEP  = 1'b1,    // streams (DSTEP, STREAM): SE's tail in the VPU
-  parameter int TMEM_IMPL  = 0        // TMEM: 0 a copy per read port (FPGA block RAM), 1 banked
-                                      //   (three copies of 1R1W RAMs: an ASIC; otpu_tmem)
+  parameter int TMEM_IMPL  = 0,       // TMEM: 0 a copy per read port (FPGA block RAM), 1 banked
+                                      //   (three copies of 1R1W RAMs: an ASIC; otpu_tmem); 2
+                                      //   (simulation only) the read arbitration of a candidate
+                                      //   with one or two copies (otpu_tmem_model,
+                                      //   docs/tmem_nocopy.md)
+  parameter bit TMEM_RQ    = 1'b0,    // TMEM_IMPL 1: the banks' addresses from the requests by
+                                      //   priority, and the arbiter grants by them (gnt_q)
+  parameter int TMEM_NCP   = 3,       // TMEM_IMPL 1: copies (3; 2, 4, 5, 7: the read slots of
+                                      //   pumped copies, docs/tmem_pump.md)
+  parameter int TMEM_NSB   = 8,       // TMEM_IMPL 3 (EXPERIMENTAL): one copy, each bank TMEM_NSB
+  parameter int TMEM_SBP   = 3,       //   RAMs, the sub-bank at word-address bit TMEM_SBP
+                                      //   (docs/tmem_nocopy.md)
+  parameter int TMEM_SBH   = 0,       // TMEM_IMPL 3: the sub-bank hashed (otpu_tmem SBH)
+  parameter bit TMEM_RPL   = 1'b0,    // TMEM_IMPL 3: lost reads replayed (otpu_tmem RPL), the
+                                      //   board's arbiter (ARB_MASK) with the replays' holds
+  parameter bit TMEM_TDP   = 1'b0,    // TMEM_IMPL 3: true dual-port RAMs (otpu_tmem TDP), a
+                                      //   unit's ports on different RAM ports (TM_SIDE)
+  parameter bit TMEM_GST   = 1'b0,    // TMEM_IMPL 3: QUANT 3 and COLL the DMA's guests, as
+                                      //   TMEM_IMPL 0's (otpu_tmem GST: one data select)
+  parameter int TMEM_PMP   = 0,       // TMEM_TDP: 1 the RAMs pumped at 2x on clk_f (otpu_tmem
+                                      //   PMP: a write takes no read port), 2 their model at the
+                                      //   core clock (simulation)
+  parameter int TMEM_PRK   = 0,       // TMEM_IMPL 3: the read ports' ranks (3 bits a port, port p
+                                      //   at bit 3p; 0: PRANK3, below)
+  parameter int TMEM_SDM   = -1,      // TMEM_TDP: the read ports' RAM sides (bit p: port p on
+                                      //   port A; -1: TM_SIDED, below)
+  parameter bit SEQ_WC     = 1'b0     // EXPERIMENTAL: otpu_seq's wait counts (WAITC, docs/seq_vpu.md)
 ) (
   input  logic          clk,
+  input  logic          clk_f,      // TMEM_PMP 1: 2 x clk, rising with it (the MMCM's); else unused
   input  logic          sys_rst,
   input  logic          rst,
   input  logic [31:0]   rinit [8],  // the run's arguments: R8..R15 at the start (otpu_seq)
@@ -73,8 +108,7 @@ module otpu_slice
   output logic [31:0]   sw_wdata,
   output logic [3:0]    sw_be,
   input  logic          a_rvalid,
-  input  logic [31:0]   a_rdata,
-  input  logic [31:0]   a_rdata2,   // the other word of a_rdata's 8-byte pair (MM PAIR scales)
+  input  logic [255:0]  a_rdata,    // the aligned 32 bytes holding the word read (MM scale lines)
   output logic          b_req,
   output logic          b_tag,
   output logic          b_we,
@@ -107,6 +141,16 @@ module otpu_slice
   input  logic          dump
 );
   localparam int BW = $clog2(LANES);
+  // the DRAM's SW ready and write idle as the units and the arbiters see them: with the SW port's
+  // output register (see there)
+  logic sw_rdy_i, wr_idle_i;
+  // port B as the units, the loader and the arbiters see it: through its output register (b_rdy_i,
+  // rd_idle_i, wr_idle_i) and its input register (b_rvalid_i, b_rtag_i, b_rdata_i); see "port B's
+  // registers"
+  logic b_rdy_i, rd_idle_i, b_rvalid_i, b_rtag_i;
+  logic [D*8-1:0] b_rdata_i;
+  // port A's ready as the MXU sees it: through its output register (see "port A's register")
+  logic a_rdy_i;
   // the stream engine (docs/stream.md): the DMA moves a stream (DSTEP, STREAM) through SE in
   // the VPU; streams need 8 lanes on both sides (otpu_dma W = 8: D >= 32). Without it DSTEP and
   // STREAM are illegal instructions (otpu_seq STREAMS: the slice stops with ERROR)
@@ -115,39 +159,148 @@ module otpu_slice
   // the board build (TMEM replicated per read port, RPB >= NRP * LANES: reads never conflict;
   // WPB = 1): the arbiter only masks write banks (see the arbiter), and the VPU's grant only
   // takes its buffered writes (otpu_vpu WBUF)
-  localparam bit ARB_MASK = (TMEM_IMPL == 0) && (RPB >= NRP * LANES) && (WPB == 1);
+  localparam bit ARB_MASK = (TMEM_IMPL == 0 || (TMEM_IMPL == 3 && TMEM_RPL)) &&
+                            (RPB >= NRP * LANES) && (WPB == 1);
   // TMEM_IMPL 1 (banked TMEM): three copies, each bank one read per cycle; the ports of one
   // group on different copies (the quantizer's three, the VPU's two), so a group alone always
   // fits: copy 0 MXU, QUANT, VPU A; copy 1 VPU B, QUANT 2; copy 2 DMA, QUANT 3, COLL. The arbiter
   // counts one read per port and bank (its lanes there read one word) per copy (gnt_k).
-  localparam int NCP = 3;
-  localparam logic [NRP-1:0][1:0] CPY = {2'd2, 2'd1, 2'd2, 2'd1, 2'd0, 2'd0, 2'd2, 2'd0};
-  //                                    COLL  Q2    Q3    VB    VA    Q     DMA   MXU
+  // TMEM_NCP 4 (two pumped copies' four read slots): MXU and VPU A, VPU B and QUANT 3, DMA and
+  // QUANT 2, QUANT and COLL
+  // TMEM_NCP 2 (one pumped copy's two read slots, P1): MXU, VPU A, QUANT 2 and COLL share one,
+  // DMA, VPU B and QUANT the other; QUANT 3 (the row factor, one word) has a third of its own, a
+  // model of the row factor kept in a register by the quantizer (two slots cannot hold the
+  // quantizer's three reads)
+  // TMEM_NCP 5 / 7 (one copy pumped at 3x / 4x: 2K - 1 read slots, their count only, at today's
+  // read latency): 5: MXU; DMA, QUANT 3 and COLL; QUANT; VPU A; VPU B and QUANT 2. 7: a slot per
+  // port, COLL on the DMA's
+  localparam int NCP = (TMEM_NCP == 2) ? 3 : TMEM_NCP;
+  localparam logic [NRP-1:0][2:0] CPY =
+    (TMEM_NCP == 2) ? {3'd0, 3'd0, 3'd2, 3'd1, 3'd0, 3'd1, 3'd1, 3'd0} :
+    (TMEM_NCP == 4) ? {3'd3, 3'd2, 3'd1, 3'd1, 3'd0, 3'd3, 3'd2, 3'd0} :
+    (TMEM_NCP == 5) ? {3'd1, 3'd4, 3'd1, 3'd4, 3'd3, 3'd2, 3'd1, 3'd0} :
+    (TMEM_NCP == 7) ? {3'd1, 3'd6, 3'd5, 3'd4, 3'd3, 3'd2, 3'd1, 3'd0} :
+                      {3'd2, 3'd1, 3'd2, 3'd1, 3'd0, 3'd0, 3'd2, 3'd0};
+  //                    COLL  Q2    Q3    VB    VA    Q     DMA   MXU
+  // TMEM_RQ: each read port's rank in the arbiter's priority order (its group's: DMA, COLL, VPU,
+  // MXU, QUANT), for the copies' request-priority bank addresses (otpu_tmem RQ)
+  localparam logic [NRP-1:0][2:0] PRANK = {3'd1, 3'd4, 3'd4, 3'd2, 3'd2, 3'd4, 3'd0, 3'd3};
+  //                                       COLL  Q2    Q3    VB    VA    Q     DMA   MXU
+  initial if (TMEM_IMPL == 1 && !(TMEM_NCP inside {2, 3, 4, 5, 7}))
+    $fatal(1, "otpu_slice: TMEM_NCP %0d (2, 3, 4, 5 or 7)", TMEM_NCP);
   initial if (TMEM_IMPL == 1 && (RPB != 1 || WPB != 1))
     $fatal(1, "otpu_slice: TMEM_IMPL 1 needs RPB = 1 and WPB = 1 (RPB %0d WPB %0d)", RPB, WPB);
+`ifdef SYNTHESIS
+  initial if (TMEM_IMPL == 2) $fatal(1, "otpu_slice: TMEM_IMPL 2 is a simulation model");
+`endif
+  initial if (TMEM_IMPL == 2 && WPB != 1)
+    $fatal(1, "otpu_slice: TMEM_IMPL 2 needs WPB = 1 (WPB %0d)", WPB);
   localparam int W_DMA = 0, W_MXU = 1, W_COLL = 2, W_VPU = 3, NWP = 4;
   // The VPU ahead of the MXU drain: the VPU writes all its lanes' banks at once, so an MXU drain
   // write in any one bank cost it the whole cycle, and decode's softmax (EXP2SUB, which the next
   // PV MM waits for) ran at about half its rate; the drain holds a cycle instead
   // (docs/litedram.md section 11, "The core's own gaps": Qwen3 4-bit -3.0% cycles per token).
   localparam int G_DMA = 0, G_COLL = 1, G_VPU = 2, G_MXU = 3, G_Q = 4, NG = 5;
+  // TMEM_IMPL 3: every read port its own rank (the groups' order, DMA COLL VPU MXU QUANT; within
+  // a group in port order) and its group
+  localparam logic [NRP-1:0][2:0] PRANK3D = {3'd1, 3'd6, 3'd7, 3'd3, 3'd2, 3'd5, 3'd0, 3'd4};
+  //                                        COLL  Q2    Q3    VB    VA    Q     DMA   MXU
+  localparam logic [NRP-1:0][2:0] PRANK3 = (TMEM_PRK != 0) ? (3 * NRP)'(TMEM_PRK) : PRANK3D;
+  localparam logic [NRP-1:0][2:0] RGRP = {3'(G_COLL), 3'(G_Q), 3'(G_Q), 3'(G_VPU), 3'(G_VPU),
+                                          3'(G_Q), 3'(G_DMA), 3'(G_MXU)};
+  // TMEM_TDP: the RAM port each read port asks on (1: port A). The VPU's and the quantizer's
+  // operands never share a RAM port. Pumped (TMEM_PMP), where the write takes neither: QUANT and
+  // VPU A on port A, the MXU, the DMA (with its guests), VPU B and QUANT 2 on port B (the fewest
+  // replays of every split, docs/tmem_nocopy.md 6.4). Not pumped, where the writes take port A
+  // first: VPU B, QUANT 3, QUANT 2 and COLL on port A, the busy readers on port B
+  localparam logic [NRP-1:0] TM_SIDED = (TMEM_PMP != 0) ? ((NRP'(1) << P_Q) | (NRP'(1) << P_VA)) :
+                                        ((NRP'(1) << P_VB) | (NRP'(1) << P_Q3) | (NRP'(1) << P_Q2) |
+                                         (NRP'(1) << P_COLL));
+  localparam logic [NRP-1:0] TM_SIDE = (TMEM_SDM >= 0) ? NRP'(TMEM_SDM) : TM_SIDED;
+  initial if (TMEM_IMPL == 3 && (WPB != 1 || ARB_MASK != TMEM_RPL))
+    $fatal(1, "otpu_slice: TMEM_IMPL 3 needs WPB = 1 (WPB %0d), and RPB >= %0d with TMEM_RPL",
+           WPB, NRP * LANES);
 
   // ---- sequencer
   cmd_t ucmd [NUNITS];
   logic [NUNITS-1:0] ustart, urdy, udone;
+  // the sequencer's side of the units' handshake: the same, except in simulation with +tm_sdly
+  // or +tm_ddly (docs/tmem_nocopy.md: the cycles a TMEM with a longer read path adds)
+  cmd_t ucmd_s [NUNITS];
+  logic [NUNITS-1:0] ustart_s, urdy_s, udone_s;
   logic urel;
   logic im_we;
   logic [31:0] im_row;
+  logic sc_we;                    // SEQ_WC: the loader's sidecar row (wait entries)
+  logic [31:0] sc_row;
+  logic [255:0] sc_data;
   seq_ev_t sq_ev;
   logic        srst;              // the sequencer's and the units' reset: rst, a CHAIN reload, or
                                   //   a WAITW timeout (to_err)
   logic        sq_halted, sq_ch, sq_err, rl_v;
   logic        dma_err;           // a WAITW timed out: the slice stops with an error (to_err)
   logic [31:0] sq_icount, sq_cha, sq_chn, rl_val;
-  otpu_seq #(.IMEM_WORDS(IMEM_WORDS), .SID(SID), .S(S), .D(D), .WIN(WIN), .STREAMS(HAS_SS)) u_seq (
-    .clk, .rst(srst), .ucmd, .ustart, .urel, .urdy, .udone, .halted(sq_halted), .error(sq_err),
+  otpu_seq #(.IMEM_WORDS(IMEM_WORDS), .TMEM_WORDS(TMEM_WORDS), .SID(SID), .S(S), .D(D),
+             .WIN(WIN), .STREAMS(HAS_SS), .WAITC(SEQ_WC)) u_seq (
+    .clk, .rst(srst), .ucmd(ucmd_s), .ustart(ustart_s), .urel, .urdy(urdy_s), .udone(udone_s),
+    .halted(sq_halted), .error(sq_err),
     .icount(sq_icount), .ev(sq_ev), .rinit, .rl_v, .rl_val, .ch_req(sq_ch), .ch_addr(sq_cha),
-    .ch_n(sq_chn), .im_we, .im_row, .im_data(b_rdata));
+    .ch_n(sq_chn), .im_we, .im_row, .im_data(b_rdata_i),
+    .sc_we, .sc_row, .sc_data);
+
+  // The units' handshake. In simulation, +tm_sdly=N starts every DMA, QUANT, VPU and collective
+  // instruction N cycles after the sequencer issues it (+tm_sidle=1: only when its unit has
+  // nothing in flight, as if a busy unit's next reads were fetched ahead), and +tm_ddly=N
+  // reports every completion N cycles late (its writes land later): the latency a TMEM with
+  // stream buffers or a registered read path adds (docs/tmem_nocopy.md). The MXU starts as
+  // issued (its stream and release, urel, are in order with its start). 0: wires.
+`ifdef SYNTHESIS
+  assign ustart = ustart_s;
+  assign urdy_s = urdy;
+  assign udone_s = udone;
+  for (genvar u = 0; u < NUNITS; u++) begin : g_hs
+    assign ucmd[u] = ucmd_s[u];
+  end
+`else
+  int hs_sd, hs_dd, hs_idle;
+  initial begin
+    hs_sd = 0; hs_dd = 0; hs_idle = 0;
+    void'($value$plusargs("tm_sdly=%d", hs_sd));
+    void'($value$plusargs("tm_ddly=%d", hs_dd));
+    void'($value$plusargs("tm_sidle=%d", hs_idle));
+    if (hs_dd > 15) $fatal(1, "otpu_slice: +tm_ddly %0d (0..15)", hs_dd);
+  end
+  logic [NUNITS-1:0] hs_pend, hs_fire, hs_dly;
+  int                hs_cnt [NUNITS], hs_busy [NUNITS];
+  cmd_t              hs_cmd [NUNITS];
+  logic [NUNITS-1:0] hs_dq [16];
+  always_comb
+    for (int u = 0; u < NUNITS; u++) begin
+      hs_dly[u] = hs_sd > 0 && u != U_MXU && (hs_idle == 0 || hs_busy[u] == 0);
+      hs_fire[u] = hs_pend[u] && hs_cnt[u] == 1;
+      ustart[u] = hs_fire[u] || (ustart_s[u] && !hs_dly[u]);
+      ucmd[u] = hs_fire[u] ? hs_cmd[u] : ucmd_s[u];
+      urdy_s[u] = urdy[u] && !hs_pend[u];
+      udone_s[u] = (hs_dd == 0) ? udone[u] : hs_dq[hs_dd - 1][u];
+    end
+  always_ff @(posedge clk) begin
+    if (srst) begin
+      hs_pend <= '0;
+      for (int u = 0; u < NUNITS; u++) begin hs_cnt[u] <= 0; hs_busy[u] <= 0; end
+    end else
+      for (int u = 0; u < NUNITS; u++) begin
+        if (ustart_s[u] && hs_dly[u]) begin
+          hs_pend[u] <= 1'b1; hs_cnt[u] <= hs_sd; hs_cmd[u] <= ucmd_s[u];
+        end else if (hs_pend[u]) begin
+          hs_cnt[u] <= hs_cnt[u] - 1;
+          if (hs_cnt[u] == 1) hs_pend[u] <= 1'b0;
+        end
+        hs_busy[u] <= hs_busy[u] + int'(ustart[u]) - int'(udone[u]);
+      end
+    hs_dq[0] <= srst ? '0 : udone;
+    for (int i = 1; i < 16; i++) hs_dq[i] <= srst ? '0 : hs_dq[i - 1];
+  end
+`endif
 
   // ---- HALT CHAIN: reload IMEM from the chained program's address, the units held in reset.
   // A WAITW timeout (dma_err) stops the slice until rst: to_err holds the sequencer and the
@@ -159,7 +312,7 @@ module otpu_slice
   logic [2:0]  to_q;
   logic [31:0] c_addr, c_n, ic_base;
   assign srst = rst || c_rst || to_err;
-  assign halted = (sq_halted && !sq_ch) || (to_q[2] && wr_idle);
+  assign halted = (sq_halted && !sq_ch) || (to_q[2] && wr_idle_i);
   assign error = sq_err || to_err;
   assign wait_to = to_err;
   assign icount = ic_base + sq_icount;
@@ -172,7 +325,7 @@ module otpu_slice
       to_err <= 1'b1;
       if (to_err && !to_q[0]) ic_base <= ic_base + sq_icount;   // its last cycle out of reset
     end else if (!c_rst) begin
-      if (sq_halted && sq_ch && wr_idle) begin
+      if (sq_halted && sq_ch && wr_idle_i) begin
         c_rst <= 1'b1; c_ld <= 1'b1;
         c_addr <= sq_cha; c_n <= sq_chn;
         ic_base <= ic_base + sq_icount;
@@ -181,19 +334,29 @@ module otpu_slice
   end
 
   // ---- program loader (see the top): ld_go once the DRAM had no read in flight; ld_ch: a HALT
-  // CHAIN reload (rst stops it). While busy the loader has port B to itself
+  // CHAIN reload (rst stops it). While busy the loader has port B to itself.
+  // SEQ_WC (docs/isa.md "Wait counts"): the program's wait entries follow its instructions in
+  // DRAM (from the next chunk on, 64 bits per instruction), and the loader reads them into the
+  // sequencer's sidecar RAM after the instructions, 4 entries a row: each chunk is read D / 32
+  // times, each read writing one row (its 256-bit part), so no chunk is held
   localparam int IPR = D / 32;
-  logic [31:0] ld_rows, ld_iss, ld_cmp, ld_a;
+  logic [31:0] ld_rows, ld_tot, ld_iss, ld_cmp, ld_a;
   logic        ld_go, ld_ch;
-  wire ld_req = ld_busy && ld_go && ld_iss < ld_rows;
+  wire ld_req = ld_busy && ld_go && ld_iss < ld_tot;
   wire [31:0] ld_n_s = ld_start ? ld_n : c_n;
-  assign im_we  = ld_busy && ld_go && b_rvalid;
+  wire        ld_wt = SEQ_WC && ld_cmp >= ld_rows;     // this read is a row of wait words
+  wire [31:0] ld_sr = ld_cmp - ld_rows;                 // its sidecar row
+  assign im_we  = ld_busy && ld_go && b_rvalid_i && !ld_wt;
   assign im_row = ld_cmp;
+  assign sc_we  = ld_busy && ld_go && b_rvalid_i && ld_wt;
+  assign sc_row = ld_sr;
+  assign sc_data = b_rdata_i[256 * (ld_sr % IPR) +: 256];
   always_ff @(posedge clk) begin
     if (sys_rst) begin
       ld_busy <= 1'b0;
     end else if (ld_start || (c_ld && !ld_busy)) begin
       ld_rows <= (ld_n_s + IPR - 1) / IPR;
+      ld_tot <= (ld_n_s + IPR - 1) / IPR + (SEQ_WC ? (ld_n_s + 3) / 4 : 0);
       ld_iss <= '0; ld_cmp <= '0;
       ld_a <= (ld_start ? ld_addr : c_addr) >> 2;
       ld_busy <= (ld_n_s != 0);
@@ -201,15 +364,16 @@ module otpu_slice
       ld_ch <= !ld_start;
     end else if (ld_busy) begin
       if (rst && ld_ch) ld_busy <= 1'b0;
-      else if (!ld_go) ld_go <= rd_idle;
+      else if (!ld_go) ld_go <= rd_idle_i;
       else begin
-        if (ld_req && b_rdy) begin
+        if (ld_req && b_rdy_i) begin
           ld_iss <= ld_iss + 1;
-          ld_a <= ld_a + D / 4;
+          // the next chunk; a chunk of wait words after its D / 32 reads
+          if (ld_iss < ld_rows || (ld_iss - ld_rows) % IPR == IPR - 1) ld_a <= ld_a + D / 4;
         end
-        if (b_rvalid) begin
+        if (b_rvalid_i) begin
           ld_cmp <= ld_cmp + 1;
-          if (ld_cmp + 1 == ld_rows) ld_busy <= 1'b0;
+          if (ld_cmp + 1 == ld_tot) ld_busy <= 1'b0;
         end
       end
     end
@@ -217,6 +381,9 @@ module otpu_slice
 
   // ---- TMEM
   logic [NRP-1:0][LANES-1:0]       rq_en, r_en;
+  logic [NRP-1:0]                  tm_bx, tm_bs, tm_sv, tm_pre;   // TMEM_IMPL 3 (below)
+  logic [NRP-1:0]                  tm_lost, tm_frz;               // TMEM_IMPL 3, TMEM_RPL
+  logic [NRP-1:0][LANES-1:0]       rq_t;
   logic [NRP-1:0][LANES-1:0][31:0] r_addr, r_data;
   logic [NWP-1:0][LANES-1:0]       wq_en, w_en;
   logic [NWP-1:0][LANES-1:0][31:0] w_addr, w_data;
@@ -224,12 +391,21 @@ module otpu_slice
   // the MXU's ports keep the crossbar (its drain writes scattered rows); the others are rotators.
   // The quantizer's row-factor port (one word) and the collective's read port, rarely busy,
   // share the DMA's copy (ST reads): 6 copies of the memory instead of 8.
+  // (TMEM_IMPL 2, simulation: IMPL 0 with a copy per read port, so any grant reads the right
+  // words; otpu_tmem_model decides the grants). IQ: TMEM's input stage (release r2,
+  // docs/tmem_nocopy.md 7): the granted writes registered in TMEM, the units' read requests in
+  // the units (each a cycle after it forms), so both move a cycle and the order holds.
   otpu_tmem #(.WORDS(TMEM_WORDS), .LANES(LANES), .NRP(NRP), .NWP(NWP), .WPB(WPB),
               .GEN_R(NRP'(1) << P_MXU), .GEN_W(NWP'(1) << W_MXU),
-              .SH_HOST(P_DMA), .SH_MASK((NRP'(1) << P_Q3) | (NRP'(1) << P_COLL)),
-              .SID(SID), .IMPL(TMEM_IMPL), .NCP(NCP), .CPY(CPY)) u_tmem (
-    .clk, .r_en, .r_req(rq_en), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
-    .w_data, .dump);
+              .SH_HOST(P_DMA),
+              .SH_MASK((TMEM_IMPL == 2) ? '0 : (NRP'(1) << P_Q3) | (NRP'(1) << P_COLL)),
+              .SID(SID), .IMPL((TMEM_IMPL == 2) ? 0 : TMEM_IMPL), .NCP(NCP), .CPY(CPY), .RQ(TMEM_RQ),
+              .PRANK((TMEM_IMPL == 3) ? PRANK3 : PRANK), .NSB(TMEM_NSB), .SBP(TMEM_SBP),
+              .GRP(RGRP), .SBH(TMEM_SBH), .RPL(TMEM_RPL), .RPLM(~(NRP'(1) << P_COLL)),
+              .TOPP(P_DMA), .TDP(TMEM_TDP), .SIDE(TM_SIDE), .GST(TMEM_GST),
+              .PMP(TMEM_PMP), .IQ(1'b1)) u_tmem (
+    .clk, .clk_f, .r_en, .r_req(rq_t), .r_addr, .r_data, .w_en, .w_req(wq_en), .w_gnt, .w_addr,
+    .w_data, .blk_x(tm_bx), .blk_s(tm_bs), .lost(tm_lost), .frz(tm_frz), .dump);
   assign coll_rdata = r_data[P_COLL];
   // the units' TMEM requests
   logic [LANES-1:0]        dma_ren, dma_wen, va_ren, vb_ren, v_wen;
@@ -244,14 +420,15 @@ module otpu_slice
   logic                   asc_we;
   logic [7:0]             act_row, asc_row, act_off;
   logic                   act_dup;
-  logic [31:0]            act_idx, asc_data;
+  logic [31:0]            act_idx;
+  logic [63:0]            asc_data;     // {da3, da2, da1, da0, Sa}
   logic [15:0]            asc_blk, act_rblk, act_rblk2;
   logic [MCOLS-1:0]       act_rhi;
   logic [7:0]             act_rgrp;
-  logic                   act_ren;
+  logic [MCOLS-1:0]       act_ren;       // per column (otpu_mxu: the MM's columns)
   logic                   mxu_pop;       // the MXU consumes a block this cycle (its ACT read)
   logic [MCOLS*D*8-1:0]   act_rdata;
-  logic [MCOLS*32-1:0]    act_rscale;
+  logic [MCOLS*64-1:0]    act_rscale;
   otpu_actram #(.D(D), .MCOLS(MCOLS), .ROWS(ACT_ROWS), .BLOCKS(ACT_BLOCKS), .LANES(ULANES)) u_act (
     .clk, .we(act_we), .w_row(act_row), .w_idx(act_idx), .w_data(act_data), .w_dup(act_dup),
     .w_off(act_off), .swe(asc_we),
@@ -310,38 +487,43 @@ module otpu_slice
   otpu_dma #(.D(D), .LANES(LANES), .HAS_DSTEP(HAS_SS)) u_dma (
     .clk, .rst(rst_dma), .start(ustart[U_DMA]), .cmd(ucmd[U_DMA]), .rdy(r_dma), .done(d_dma),
     .err(dma_err), .ww_held(a_inval),
-    .b_req(dma_breq), .b_gnt(b_rdy), .b_we(dma_bwe), .b_wmask(dma_bwmask), .b_wdata(dma_bwdata),
-    .b_addr(dma_baddr), .b_rvalid(b_rvalid && b_rtag), .b_rdata, .wr_idle,
+    .b_req(dma_breq), .b_gnt(b_rdy_i), .b_we(dma_bwe), .b_wmask(dma_bwmask), .b_wdata(dma_bwdata),
+    .b_addr(dma_baddr), .b_rvalid(b_rvalid_i && b_rtag_i), .b_rdata(b_rdata_i), .wr_idle(wr_idle_i),
     .t_ren(dma_ren), .t_raddr(dma_raddr), .t_rdata(r_data[P_DMA]),
     .t_wen(dma_wen), .t_waddr(dma_waddr), .t_wdata(dma_wdata),
     .ss_req, .ss_gnt, .ss_cfg, .ss_pe, .ss_in_v, .ss_in_d, .ss_fk, .ss_fi, .ss_fd,
     .ss_y_v, .ss_y_d, .ss_o_v, .ss_o_d);
 
   otpu_mxu #(.D(D), .MCOLS(MCOLS), .ROWS(ACT_ROWS), .DEPTH(FIFO_DEPTH), .LANES(ULANES), .IMPL(MXU_IMPL),
-             .CL(MXU_CL), .SID(SID)) u_mxu (
+             .CL(MXU_CL), .E(MXU_E), .SID(SID)) u_mxu (
     .clk, .rst(rst_mxu), .start(ustart[U_MXU]), .go(urel), .cmd(ucmd[U_MXU]), .rdy(r_mxu), .done(d_mxu),
     .computing(mxu_pop), .pf_level(mxu_level), .pf_starve(mxu_starve), .pf_block(mxu_block),
     .pf_u(mxu_u), .pf_uv(mxu_uv),
     .act_blk(act_rblk), .act_blk2(act_rblk2), .act_hi(act_rhi), .act_grp(act_rgrp), .act_ren, .act_data(act_rdata), .act_scale(act_rscale),
-    .a_req(mxu_areq), .a_addr(mxu_aaddr), .a_gnt(mxu_agnt), .a_rvalid, .a_rdata, .a_rdata2,
-    .b_req(mxu_breq), .b_addr(mxu_baddr), .b_gnt(mxu_bgnt), .b_rvalid(b_rvalid && !b_rtag),
-    .b_rdata,
+    .a_req(mxu_areq), .a_addr(mxu_aaddr), .a_gnt(mxu_agnt), .a_rvalid, .a_rdata,
+    .b_req(mxu_breq), .b_addr(mxu_baddr), .b_gnt(mxu_bgnt), .b_rvalid(b_rvalid_i && !b_rtag_i),
+    .b_rdata(b_rdata_i),
     .t_ren(mxu_ren), .t_raddr(mxu_raddr), .t_rdata(r_data[P_MXU][ULANES-1:0]),
     .t_wen(mxu_wen), .t_waddr(mxu_waddr), .t_wdata(mxu_wdata), .t_gnt(gnt[G_MXU]));
 
-  otpu_quant #(.D(D), .LANES(ULANES), .SID(SID)) u_quant (
+  // the quantizer's group maxes of a row (MX offsets; not ROW mode): a QACT's 4 KB (KB <=
+  // ACT_BLOCKS: the ACT RAM's bound) and a QST's KB (its row in TMEM: KB <= TMEM_WORDS / D), so
+  // every QACT and QST the ISA's bounds allow fits (the card: 512)
+  localparam int QG = (4 * ACT_BLOCKS > TMEM_WORDS / D) ? 4 * ACT_BLOCKS : TMEM_WORDS / D;
+  localparam int Q_GR = (QG <= 8) ? 8 : (1 << $clog2(QG));
+  otpu_quant #(.D(D), .LANES(ULANES), .GR(Q_GR), .XD(QUANT_XD), .SID(SID)) u_quant (
     .clk, .rst(rst_q), .start(ustart[U_Q]), .cmd(ucmd[U_Q]), .rdy(r_q), .done(d_q), .gnt(gnt[G_Q]),
     .t_ren(q_ren), .t_raddr(q_raddr), .t_rdata(r_data[P_Q][ULANES-1:0]),
     .t_ren2(q_ren2), .t_raddr2(q_raddr2), .t_rdata2(r_data[P_Q2][ULANES-1:0]),
     .t_ren3(q3_en), .t_raddr3(q3_addr), .t_rdata3(r_data[P_Q3][0]),
     .act_we, .act_row, .act_idx, .act_data, .act_dup, .act_off, .asc_we, .asc_row, .asc_blk, .asc_data,
-    .a_want(q_awant), .wr_idle,
+    .a_want(q_awant), .wr_idle(wr_idle_i),
     .a_req(q_areq), .a_we(q_awe), .a_addr(q_aaddr), .a_wdata(q_awdata), .a_be(q_abe),
     .pf_u(q_u), .pf_frz(q_frz));
 
   otpu_vpu #(.LANES(LANES), .CL(VPU_CL), .SID(SID), .WBUF(ARB_MASK), .HAS_SE(HAS_SS)) u_vpu (
     .clk, .rst(rst_vpu), .start(ustart[U_VPU]), .cmd(ucmd[U_VPU]), .rdy(r_vpu), .done(d_vpu),
-    .gnt(gnt[G_VPU]), .ren(v_ren),
+    .gnt(gnt[G_VPU]), .ren(v_ren), .rhold(tm_lost[P_VA] || tm_lost[P_VB]),
     .ta_en(va_ren), .ta_addr(va_raddr), .ta_data(r_data[P_VA]),
     .tb_en(vb_ren), .tb_addr(vb_raddr), .tb_data(r_data[P_VB]),
     .tw_en(v_wen), .tw_addr(v_waddr), .tw_data(v_wdata), .pf_u(v_u), .pf_frz(v_frz),
@@ -359,23 +541,27 @@ module otpu_slice
   // RLD: the word through the collective's read port (lane 0) once granted; the lane has it
   // the next cycle (rl_got), registered (rl_cv), converted (rl_c1), times the multiplier
   // (1 without MUL) as two partial products (rl_c2: the low 32 bits of x * m[15:0] and the
-  // low 16 of x[15:0] * m[31:16]), summed and handed to the sequencer (rl_v)
-  logic        rl_pend, rl_got, rl_cv, rl_c1, rl_c2, rl_raw;
+  // low 16 of x[15:0] * m[31:16]), summed and handed to the sequencer (rl_v). The read is asked
+  // from rl_pend's second cycle (rl_pq): TMEM's input stage puts every unit's read a cycle after
+  // it forms, and the writes a cycle after their grant, so RLD's read moves with them
+  // (release r2, docs/tmem_nocopy.md 7)
+  logic        rl_pend, rl_pq, rl_got, rl_cv, rl_c1, rl_c2, rl_raw;
   logic [31:0] rl_a, rl_w, rl_m, rl_x, rl_pl;
   logic [15:0] rl_ph;
   wire         rl_busy = rl_pend || rl_got || rl_cv || rl_c1 || rl_c2 || rl_v;
   always_ff @(posedge clk) begin
     if (srst) begin
-      rl_pend <= 1'b0; rl_got <= 1'b0; rl_cv <= 1'b0; rl_c1 <= 1'b0; rl_c2 <= 1'b0;
+      rl_pend <= 1'b0; rl_pq <= 1'b0; rl_got <= 1'b0; rl_cv <= 1'b0; rl_c1 <= 1'b0; rl_c2 <= 1'b0;
       rl_v <= 1'b0;
     end else begin
-      rl_got <= rl_pend && r_en[P_COLL][0];
+      rl_got <= rl_pq && r_en[P_COLL][0];
+      rl_pq <= rl_pend && !(rl_pq && r_en[P_COLL][0]);
       if (rl_start) begin
         rl_pend <= 1'b1;
         rl_a <= ucmd[U_COLL].w1;
         rl_raw <= ucmd[U_COLL].flags[RF_RAW];
         rl_m <= ucmd[U_COLL].flags[RF_MUL] ? ucmd[U_COLL].w2 : 32'd1;
-      end else if (rl_pend && r_en[P_COLL][0]) rl_pend <= 1'b0;
+      end else if (rl_pq && r_en[P_COLL][0]) rl_pend <= 1'b0;
       rl_cv <= rl_got;
       if (rl_got) rl_w <= r_data[P_COLL][0];
       rl_c1 <= rl_cv;
@@ -400,7 +586,7 @@ module otpu_slice
     rq_en[P_VA] = va_ren;     r_addr[P_VA] = va_raddr;
     rq_en[P_VB] = vb_ren;     r_addr[P_VB] = vb_raddr;
     rq_en[P_COLL] = coll_ren; r_addr[P_COLL] = coll_raddr;
-    if (rl_pend) begin rq_en[P_COLL][0] = 1'b1; r_addr[P_COLL][0] = rl_a; end
+    if (rl_pq) begin rq_en[P_COLL][0] = 1'b1; r_addr[P_COLL][0] = rl_a; end
     wq_en[W_DMA] = dma_wen;   w_addr[W_DMA] = dma_waddr;   w_data[W_DMA] = dma_wdata;
     wq_en[W_MXU][ULANES-1:0] = mxu_wen;
     w_addr[W_MXU][ULANES-1:0] = mxu_waddr;
@@ -462,13 +648,22 @@ module otpu_slice
   // the guests on the DMA's TMEM copy read only when no port before them there asks (from the
   // requests: the copy's block RAM address does not wait for the grants)
   // (TMEM_IMPL 1: no guests, the banked arbiter counts every copy's banks)
-  wire q3_blk = (TMEM_IMPL == 0) && (|rq_en[P_Q3]) && (|rq_en[P_DMA]);
-  wire coll_blk = (TMEM_IMPL == 0) && (|rq_en[P_COLL]) && ((|rq_en[P_DMA]) || (|rq_en[P_Q3]));
+  localparam bit GUESTS = TMEM_IMPL == 0 || (TMEM_IMPL == 3 && TMEM_GST);
+  wire q3_blk = GUESTS && (|rq_en[P_Q3]) && (|rq_en[P_DMA]);
+  wire coll_blk = GUESTS && (|rq_en[P_COLL]) && ((|rq_en[P_DMA]) || (|rq_en[P_Q3]));
+  // TMEM_RPL: a group whose port replays a lost read is held (tm_frz, a register); the
+  // collective, which is not replayed, reads only where its request does not lose (tm_bx)
+  logic [NG-1:0] rpl_hold, rpl_frz;
+  always_comb
+    for (int g = 0; g < NG; g++) begin
+      rpl_frz[g] = TMEM_RPL && g != G_VPU && g != G_COLL && (tm_frz & grp_rports(g)) != '0;
+      rpl_hold[g] = rpl_frz[g] || (TMEM_RPL && g == G_COLL && tm_bx[P_COLL] && |rq_en[P_COLL]);
+    end
   always_comb begin
     for (int g = 0; g < NG; g++) begin
-      aok[g] = 1'b1;
+      aok[g] = !rpl_hold[g];
       for (int h = 0; h < g; h++) if (aok[h] && acf[g][h]) aok[g] = 1'b0;
-      if (g == G_Q && q_awant && !sw_rdy) aok[g] = 1'b0;   // QST write the DRAM cannot take
+      if (g == G_Q && q_awant && !sw_rdy_i) aok[g] = 1'b0;   // QST write the DRAM cannot take
       if ((g == G_Q && q3_blk) || (g == G_COLL && coll_blk)) aok[g] = 1'b0;
     end
     gnt_m = aok;
@@ -476,11 +671,13 @@ module otpu_slice
     cgl_m = aok[G_COLL];
   end
 
-  logic [NG-1:0] gnt_k;
-  logic          cgl_k;
+  logic [NG-1:0] gnt_k, gnt_q, gnt_x, gnt_s;
+  logic          cgl_k, cgl_q, cgl_x, cgl_s;
   always_comb begin
-    gnt = ARB_MASK ? gnt_m : (TMEM_IMPL == 1) ? gnt_k : gnt_c;
-    coll_gnt_local = ARB_MASK ? cgl_m : (TMEM_IMPL == 1) ? cgl_k : cgl_c;
+    gnt = ARB_MASK ? gnt_m : (TMEM_IMPL == 1) ? (TMEM_RQ ? gnt_q : gnt_k) :
+          (TMEM_IMPL == 2) ? gnt_x : (TMEM_IMPL == 3) ? gnt_s : gnt_c;
+    coll_gnt_local = ARB_MASK ? cgl_m : (TMEM_IMPL == 1) ? (TMEM_RQ ? cgl_q : cgl_k) :
+                     (TMEM_IMPL == 2) ? cgl_x : (TMEM_IMPL == 3) ? cgl_s : cgl_c;
     for (int p = 0; p < NRP; p++) r_en[p] = rq_en[p];
     for (int p = 0; p < NWP; p++) w_en[p] = wq_en[p];
     w_gnt = '1;
@@ -492,7 +689,70 @@ module otpu_slice
     if (!v_ren)       begin r_en[P_VA] = '0; r_en[P_VB] = '0; end
     if (!gnt[G_VPU])  w_en[W_VPU] = '0;
     if (!gnt[G_COLL]) begin r_en[P_COLL] = '0; w_en[W_COLL] = '0; end
+    if (TMEM_IMPL == 3 && !TMEM_RPL)  // a split group's ports: read once, ahead of the grant
+      for (int p = 0; p < NRP; p++) begin
+        if (tm_sv[p]) r_en[p] = '0;
+        if (tm_pre[p]) r_en[p] = rq_en[p];
+      end
   end
+
+  // TMEM_IMPL 3 (EXPERIMENTAL, docs/tmem_nocopy.md): one copy of sub-banked RAMs (otpu_tmem IMPL
+  // 3). A group is granted when no port of another group blocks one of its reads (tm_bx, from
+  // the requests: the RAMs' addresses do not wait for the grants), its write banks are free (acf,
+  // as gnt_q) and its own ports do not collide (tm_bs). When they do, its ports read over
+  // successive cycles: those not blocked read ahead of the grant (tm_pre: their lanes hold the
+  // words), drop out of the requests (tm_sv), and the unit is granted when the rest can read.
+  // (TMEM_RPL: the requests of a group held for a replay, and the VPU's while its registered
+  // enable is low, ask no RAM.) TMEM_RPL with guests: the collective asks only when the guests'
+  // rule lets it read (coll_blk, from the requests). While QUANT holds for a replay its QUANT 3
+  // request asks nothing but is still up, and coll_blk keeps the collective from reading; had the
+  // collective asked, the DMA's asker, first in rank, would ask for its words every cycle, and a
+  // replay on that RAM side (the one holding QUANT among them) would lose to it for good. Every
+  // ask of the DMA's asker is then a read that happens, unless the read waits on something no
+  // replay holds up (the DRAM's write room for a QST, another slice's grant of the collective,
+  // the DMA's write banks), and a replay waits only on it and on older replays (otpu_tmem)
+  always_comb begin
+    logic [NRP-1:0] off;
+    off = '0;
+    if (TMEM_IMPL == 3 && TMEM_RPL)
+      for (int g = 0; g < NG; g++)
+        if ((g == G_VPU) ? !v_ren : rpl_frz[g]) off = off | grp_rports(g);
+    if (TMEM_IMPL == 3 && TMEM_RPL && coll_blk) off[P_COLL] = 1'b1;
+    for (int p = 0; p < NRP; p++)
+      rq_t[p] = ((TMEM_IMPL == 3 && !TMEM_RPL && tm_sv[p]) || off[p]) ? '0 : rq_en[p];
+  end
+  logic [NG-1:0] gs3;
+  always_comb begin
+    gnt_s = gs3;
+    gnt_s[G_COLL] = coll_gnt;      // every slice must grant the collective
+  end
+  always_comb begin
+    logic [NG-1:0]  gs;
+    logic [NRP-1:0] rp, ask;
+    logic           rd_ok, self;
+    tm_pre = '0;
+    for (int p = 0; p < NRP; p++) ask[p] = |rq_t[p];
+    for (int g = 0; g < NG; g++) begin
+      rp = grp_rports(g);
+      rd_ok = (tm_bx & rp & ask) == '0;
+      self = (tm_bs & rp & ask) != '0;
+      gs[g] = rd_ok && !self;
+      for (int h = 0; h < g; h++) if (gs[h] && acf[g][h]) gs[g] = 1'b0;
+      if (g == G_Q && q_awant && !sw_rdy_i) gs[g] = 1'b0;    // QST write the DRAM cannot take
+      if (rd_ok && self) tm_pre = tm_pre | (rp & ask & ~tm_bs);
+    end
+    gs3 = gs;
+    cgl_s = gs[G_COLL];
+  end
+  always_ff @(posedge clk)
+    if (srst || TMEM_IMPL != 3 || TMEM_RPL) tm_sv <= '0;
+    else
+      for (int g = 0; g < NG; g++) begin
+        logic [NRP-1:0] rp;
+        rp = grp_rports(g);
+        for (int p = 0; p < NRP; p++)
+          if (rp[p]) tm_sv[p] <= gnt[g] ? 1'b0 : (tm_sv[p] | tm_pre[p]);
+      end
 
   always_comb begin
     int rc [LANES];
@@ -519,7 +779,7 @@ module otpu_slice
       ok = 1'b1;
       for (int b = 0; b < LANES; b++)
         if (rc[b] + ur[b] > RPB || wc[b] + uw[b] > WPB) ok = 1'b0;
-      if (g == G_Q && q_awant && !sw_rdy) ok = 1'b0;    // QST write the DRAM cannot take
+      if (g == G_Q && q_awant && !sw_rdy_i) ok = 1'b0;    // QST write the DRAM cannot take
       if ((g == G_Q && q3_blk) || (g == G_COLL && coll_blk)) ok = 1'b0;
       if (g == G_COLL) begin
         cgl_c = ok;
@@ -531,6 +791,28 @@ module otpu_slice
         for (int b = 0; b < LANES; b++) begin rc[b] += ur[b]; wc[b] += uw[b]; end
     end
   end
+
+  // TMEM_IMPL 2 (simulation): a candidate's read arbitration (otpu_tmem_model, plusargs)
+`ifndef SYNTHESIS
+  if (TMEM_IMPL == 2) begin : g_model
+    otpu_tmem_model #(.LANES(LANES), .NRP(NRP), .NWP(NWP), .NG(NG),
+                      //      COLL    Q2      Q3      VB      VA      Q       DMA     MXU
+                      .RGRP({3'(G_COLL), 3'(G_Q), 3'(G_Q), 3'(G_VPU), 3'(G_VPU), 3'(G_Q),
+                             3'(G_DMA), 3'(G_MXU)}),
+                      //      VPU       COLL       MXU       DMA
+                      .WGRP({3'(G_VPU), 3'(G_COLL), 3'(G_MXU), 3'(G_DMA)}),
+                      .GCOLL(G_COLL), .SID(SID)) u_model (
+      .clk, .rst(srst), .run(!srst && !halted), .rq_en, .r_addr, .wq_en, .w_addr,
+      .r_take(r_en), .w_take(w_en), .blk(NG'(q_awant && !sw_rdy_i) << G_Q), .coll_gnt,
+      .gnt(gnt_x), .cgl(cgl_x));
+  end else begin : g_nomodel
+    assign gnt_x = '0;
+    assign cgl_x = 1'b0;
+  end
+`else
+  assign gnt_x = '0;
+  assign cgl_x = 1'b0;
+`endif
 
   // The banked TMEM's arbiter (TMEM_IMPL 1): as gnt_c, but each copy's bank takes one read per
   // cycle, and a port's lanes in one bank count once (they read one word there)
@@ -557,7 +839,7 @@ module otpu_slice
           for (int l = 0; l < LANES; l++)
             if (wq_en[p][l]) vk[w_addr[p][l][BW-1:0]] = 1'b1;
       if ((rk & uk) != '0 || (wk & vk) != '0) ok = 1'b0;
-      if (g == G_Q && q_awant && !sw_rdy) ok = 1'b0;    // QST write the DRAM cannot take
+      if (g == G_Q && q_awant && !sw_rdy_i) ok = 1'b0;    // QST write the DRAM cannot take
       if (g == G_COLL) begin
         cgl_k = ok;
         gnt_k[g] = coll_gnt;      // every slice must grant the collective
@@ -568,33 +850,158 @@ module otpu_slice
     end
   end
 
-  // ---- DRAM ports
-  assign mxu_bgnt = !dma_breq && b_rdy;
-  assign mxu_agnt = a_rdy;
+  // The banked TMEM with request-priority addresses (TMEM_IMPL 1, TMEM_RQ): a group's reads are
+  // blocked where a group before it asks for the same copy and bank, granted or not (each copy's
+  // bank address is the first asking port's: otpu_tmem RQ), so the RAMs' addresses come from the
+  // requests alone and the grants reach no RAM pin. Its write banks are admitted as gnt_m's, a
+  // chain of single bits over the pairwise conflicts (acf).
+  logic [NG-1:0][NCP-1:0][LANES-1:0] qk;
+  logic [NG-1:0]                     qblk;
   always_comb begin
-    a_req    = mxu_areq;
-    a_we     = 1'b0;
-    a_addr   = mxu_aaddr;
-    a_wdata  = '0;
-    a_be     = '0;
-    sw_req   = q_areq && q_awe;
-    sw_addr  = q_aaddr;
-    sw_wdata = q_awdata;
-    sw_be    = q_abe;
-    b_req   = dma_breq | mxu_breq;
-    b_tag   = dma_breq;
-    b_we    = dma_bwe;
-    b_wmask = dma_bwmask;
-    b_wdata = dma_bwdata;
-    b_addr  = dma_breq ? dma_baddr : mxu_baddr;
+    logic [NRP-1:0] rp;
+    for (int g = 0; g < NG; g++) begin
+      rp = grp_rports(g);
+      qk[g] = '0;
+      for (int p = 0; p < NRP; p++)
+        if (rp[p])
+          for (int l = 0; l < LANES; l++)
+            if (rq_en[p][l]) qk[g][CPY[p]][r_addr[p][l][BW-1:0]] = 1'b1;
+    end
+    for (int g = 0; g < NG; g++) begin
+      qblk[g] = 1'b0;
+      for (int h = 0; h < g; h++) if ((qk[g] & qk[h]) != '0) qblk[g] = 1'b1;
+    end
+  end
+  always_comb begin
+    logic [NG-1:0] ok;
+    for (int g = 0; g < NG; g++) begin
+      ok[g] = !qblk[g];
+      for (int h = 0; h < g; h++) if (ok[h] && acf[g][h]) ok[g] = 1'b0;
+      if (g == G_Q && q_awant && !sw_rdy_i) ok[g] = 1'b0;    // QST write the DRAM cannot take
+    end
+    gnt_q = ok;
+    gnt_q[G_COLL] = coll_gnt;      // every slice must grant the collective
+    cgl_q = ok[G_COLL];
+  end
+
+  // ---- the SW port's output register (docs/asic.md "The ports"): the QST writes leave the slice
+  // from flip-flops, not through the quantizer's scale-row words and the TMEM grant (on the card
+  // the quantizer -> the DRAM adapter's gather registers: 5-14 levels, 4-7 ns of route; -0.260 ns
+  // in an r2 candidate, -0.092 ns in an r2.1 one). The register takes a write when it is empty or
+  // drains this cycle (sw_rdy_i, what the arbiters see: sw_rdy does not depend on sw_req), and a
+  // write in it counts as one the DRAM has not taken (wr_idle_i), so a QST, a HALT CHAIN and a
+  // WAITW timeout still end only once the DRAM has every write (and a write in port B's output
+  // register, below, counts the same). sw_req is its valid bit: outside the slice, every write it
+  // gave is taken once wr_idle && !sw_req && !(b_req && b_we) (otpu_board's STATUS WR_IDLE and
+  // go_ok). Only the loader's reset clears it: a write the quantizer gave before a run's reset
+  // (rst) still goes out, as one in the DRAM's queues does. The units and the arbiters read the
+  // DRAM's sw_rdy and wr_idle only through it (tests/test_target.py)
+  wire  sw_req_c = q_areq && q_awe;
+  logic sw_v;
+  assign sw_rdy_i  = !sw_v || sw_rdy;
+  assign wr_idle_i = wr_idle && !sw_v && !(b_req && b_we);
+  assign sw_req    = sw_v;
+  always_ff @(posedge clk) begin : sw_reg
+    if (sys_rst) sw_v <= 1'b0;
+    else if (sw_rdy_i) sw_v <= sw_req_c;
+    if (sw_rdy_i && sw_req_c) begin
+      sw_addr <= q_aaddr; sw_wdata <= q_awdata; sw_be <= q_abe;
+    end
+  end : sw_reg
+`ifndef SYNTHESIS
+  // the arbiters withhold the quantizer's grant while the port cannot take its write
+  always @(posedge clk)
+    if (!sys_rst && sw_req_c && !sw_rdy_i)
+      $fatal(1, "otpu_slice: a QST write the SW port cannot take");
+`endif
+
+  // ---- DRAM ports: the MXU's port A reads, and port B's requests (b_*_c), into their output
+  // registers (below)
+  logic           b_req_c, b_tag_c, b_we_c, b_par_c;
+  logic [D/4-1:0] b_wmask_c;
+  logic [D*8-1:0] b_wdata_c;
+  logic [31:0]    b_addr_c;
+  assign mxu_bgnt = !dma_breq && b_rdy_i;
+  assign mxu_agnt = a_rdy_i;
+  assign a_we    = 1'b0;               // port A carries the MXU's scale reads only
+  assign a_wdata = '0;
+  assign a_be    = '0;
+  always_comb begin
+    b_req_c   = dma_breq | mxu_breq;
+    b_tag_c   = dma_breq;
+    b_we_c    = dma_bwe;
+    b_wmask_c = dma_bwmask;
+    b_wdata_c = dma_bwdata;
+    b_addr_c  = dma_breq ? dma_baddr : mxu_baddr;
     // the address's parity from each source's own address (their registers), muxed with it:
     // the parity of the muxed address ran on from the DMA's request and the MXU's grant into
     // every write of otpu_native_dram's queues (DMA occ -> qbm, 11 levels, the 959b425 build's
-    // worst DMA -> memory paths, -0.390 ns at 133.33 MHz)
-    b_par   = dma_breq ? ^dma_baddr[31:5] : ^mxu_baddr[31:5];
+    // worst DMA -> memory paths, -0.390 ns at 133.33 MHz); it now ends at the output register
+    b_par_c   = dma_breq ? ^dma_baddr[31:5] : ^mxu_baddr[31:5];
     if (ld_busy) begin                // the units are held in reset
-      b_req = ld_req; b_tag = 1'b1; b_we = 1'b0; b_addr = ld_a; b_par = ^ld_a[31:5];
+      b_req_c = ld_req; b_tag_c = 1'b1; b_we_c = 1'b0; b_addr_c = ld_a; b_par_c = ^ld_a[31:5];
     end
+  end
+
+  // ---- port B's registers (docs/asic.md "The ports"): the requests (b_req ... b_par) leave the
+  // slice from flip-flops and the read data (b_rvalid, b_rtag, b_rdata) enters through
+  // flip-flops, so neither the DMA's and the MXU's request logic nor the units' read paths reach
+  // the boundary (the ASIC card point: the DMA's write-data rotator -> b_wdata, -0.59 ns at
+  // 2.5 ns with the clock's insertion delay credited, -2.50 ns against the ideal I/O clock; the
+  // card's FPGA: the DMA -> the adapter's queue RAM, +0.162 ns on r2.1's E3, 6.4 ns of route).
+  // The output register takes a request when it is empty or drains this cycle (b_rdy_i, what
+  // the DMA, the MXU and the loader see: b_rdy does not depend on b_req), b_req its valid bit.
+  // A write in it is one the DRAM has not taken (wr_idle_i, with the SW register's), a read in it
+  // or its data in the input register one not back (rd_idle_i, with port A's: the loader's
+  // start). Only the
+  // loader's reset clears them: a request given before a run's reset (rst) still goes out, and
+  // its data comes back, as one in the DRAM's queues. The units, the loader and the arbiters read
+  // the DRAM's b_rdy, rd_idle, b_rvalid, b_rtag and b_rdata only through them
+  // (tests/test_target.py). One cycle more each way costs nothing measurable (co-simulated:
+  // within +-0.07% at m4 on decode, a tiled prompt run and a MoE step, signs mixed)
+  assign b_rdy_i   = !b_req || b_rdy;
+  assign rd_idle_i = rd_idle && !a_req && !(b_req && !b_we) && !b_rvalid_i;
+  always_ff @(posedge clk) begin : pb_reg
+    if (sys_rst) b_req <= 1'b0;
+    else if (b_rdy_i) b_req <= b_req_c;
+    if (b_rdy_i && b_req_c) begin
+      b_tag <= b_tag_c; b_we <= b_we_c; b_wmask <= b_wmask_c; b_wdata <= b_wdata_c;
+      b_addr <= b_addr_c; b_par <= b_par_c;
+    end
+    b_rvalid_i <= !sys_rst && b_rvalid;
+    if (b_rvalid) begin
+      b_rtag_i <= b_rtag; b_rdata_i <= b_rdata;
+    end
+  end : pb_reg
+
+  // ---- port A's register (docs/asic.md "The ports"): the MXU's scale reads (a_req, a_addr) leave
+  // the slice from flip-flops, so the MXU's issue (the DMA's request -> port B's grant -> the
+  // MXU's issue -> a_req: the ASIC card point's a_req, -1.62 ns against the ideal I/O clock), and
+  // a_rdy and b_rdy through it, do not reach the boundary. It is the register the card's DRAM
+  // adapter took port A's requests into (otpu_native_dram), moved here: one register between the
+  // MXU and the adapter's queues on the card as before, so the same cycles. It takes a request
+  // when it is empty or drains this cycle (a_rdy_i, the MXU's grant: a_rdy does not depend on
+  // a_req), a_req its valid bit; a read in it is one not back (rd_idle_i). Only the loader's
+  // reset clears it, as the adapter's did: it holds a request, not data, and the adapter's
+  // a_flush (a run's reset, a load, a WAITW's word holding) drops the beats it holds (its
+  // reused beat and runs), so a read that leaves after a flush reads the memory as the host left
+  // it. The read data needs none: the MXU registers a_rdata at the port (ln1)
+  assign a_rdy_i = !a_req || a_rdy;
+  always_ff @(posedge clk) begin : pa_reg
+    if (sys_rst) a_req <= 1'b0;
+    else if (a_rdy_i) a_req <= mxu_areq;
+    if (a_rdy_i && mxu_areq) a_addr <= mxu_aaddr;
+  end : pa_reg
+
+  // a unit's DRAM request waiting for its port, a cycle late (pf: the board's B_STALL and
+  // DRAM_WAIT): port B's (the DMA, the MXU stream, the loader, which runs in reset), port A's (the
+  // MXU's scales), the quantizer's QST write. A request parked in the SW, port A or port B register
+  // while the DRAM refuses it is not one: the unit that gave it has moved on (an MXU at its stream's
+  // tag limit waits for its data, not for the port)
+  logic bw_r, dw_r;
+  always_ff @(posedge clk) begin
+    bw_r <= !sys_rst && b_req_c && !b_rdy_i;
+    dw_r <= !sys_rst && ((b_req_c && !b_rdy_i) || (mxu_areq && !a_rdy_i) || (q_awant && !sw_rdy_i));
   end
 
   // ---- activity and trace events (pf; docs/observability.md). The sequencer's events come
@@ -603,7 +1010,8 @@ module otpu_slice
   //   P  per window of `win` cycles: DRAM port B requests (MXU bm, DMA bd), port A requests
   //      (MXU am, QST aq), MXU compute (mx), and cycles the MXU drain, QUANT, VPU and collective
   //      lost to TMEM bank arbitration (fm fq fv fc)
-  //   Q  the same window: a port B / A request waited for the memory (bs, as), the MXU had work
+  //   Q  the same window: a unit's port B / port A or QST request waited for its port (bs, as;
+  //      as dwait above: not one parked in a port's register), the MXU had work
   //      but no chunk (ms) or chunks but did not consume (mb), the summed MXU chunk-FIFO level
   //      (ff; average = ff / n), the program loader used port B (ld)
   //   H  at the halt: the port requests since reset (bmxu bdma amxu aq)
@@ -616,6 +1024,137 @@ module otpu_slice
   wire lose_q   = !gnt[G_Q] && ((|rq_en[P_Q]) || (|rq_en[P_Q2]) || q3_en);
   wire lose_vpu = !gnt[G_VPU] && ((|rq_en[P_VA]) || (|rq_en[P_VB]) || (|wq_en[W_VPU]));
   wire lose_col = !gnt[G_COLL] && ((|rq_en[P_COLL]) || (|wq_en[W_COLL]));
+
+`ifndef SYNTHESIS
+  // TMEM read demand (docs/tmem_pump.md; simulation only, a TMEMSTAT line at the end): each cycle
+  // out of reset and before the halt, how many read streams ask (MXU; the DMA's copy: DMA,
+  // QUANT 3, COLL; QUANT; VPU A; VPU B; QUANT 2: 0..6), the most read ports asking for one bank
+  // (0..8), the same with a write asking for that bank (0..9), the cycles the MXU, QUANT, the
+  // VPU and the collective lost to the arbitration, and each read port's reads (rd: cycles it
+  // reads) and lost reads (rpl: TMEM_RPL's replays, tm_lost)
+  longint ts_cyc, ts_lose [4], ts_n [7], ts_d [NRP + 1], ts_dw [NRP + 2], ts_rd [NRP], ts_rpl [NRP];
+  initial begin
+    ts_cyc = 0;
+    for (int i = 0; i < NRP; i++) begin ts_rd[i] = 0; ts_rpl[i] = 0; end
+    for (int i = 0; i < 4; i++) ts_lose[i] = 0;
+    for (int i = 0; i < 7; i++) ts_n[i] = 0;
+    for (int i = 0; i <= NRP; i++) ts_d[i] = 0;
+    for (int i = 0; i <= NRP + 1; i++) ts_dw[i] = 0;
+  end
+  always @(posedge clk)
+    if (!srst && !halted) begin
+      int n, dm, dwm, c;
+      logic [LANES-1:0] wb;
+      logic hit;
+      n = int'(|rq_en[P_MXU]) + int'((|rq_en[P_DMA]) || (|rq_en[P_Q3]) || (|rq_en[P_COLL])) +
+          int'(|rq_en[P_Q]) + int'(|rq_en[P_VA]) + int'(|rq_en[P_VB]) + int'(|rq_en[P_Q2]);
+      wb = '0;
+      for (int p = 0; p < NWP; p++)
+        for (int l = 0; l < LANES; l++) if (wq_en[p][l]) wb[w_addr[p][l][BW-1:0]] = 1'b1;
+      dm = 0; dwm = 0;
+      for (int b = 0; b < LANES; b++) begin
+        c = 0;
+        for (int p = 0; p < NRP; p++) begin
+          hit = 1'b0;
+          for (int l = 0; l < LANES; l++)
+            if (rq_en[p][l] && r_addr[p][l][BW-1:0] == BW'(b)) hit = 1'b1;
+          c += int'(hit);
+        end
+        if (c > dm) dm = c;
+        if (c + int'(wb[b]) > dwm) dwm = c + int'(wb[b]);
+      end
+      ts_cyc++; ts_n[n]++; ts_d[dm]++; ts_dw[dwm]++;
+      for (int p = 0; p < NRP; p++) begin
+        if (|r_en[p]) ts_rd[p]++;
+        if (tm_lost[p]) ts_rpl[p]++;
+      end
+      if (lose_mxu) ts_lose[0]++;
+      if (lose_q)   ts_lose[1]++;
+      if (lose_vpu) ts_lose[2]++;
+      if (lose_col) ts_lose[3]++;
+    end
+  final begin
+    string s;
+    s = $sformatf("TMEMSTAT sid=%0d cyc=%0d lose=%0d,%0d,%0d,%0d n=", SID, ts_cyc, ts_lose[0],
+                  ts_lose[1], ts_lose[2], ts_lose[3]);
+    for (int i = 0; i < 7; i++) s = {s, $sformatf("%s%0d", (i > 0) ? "," : "", ts_n[i])};
+    s = {s, " d="};
+    for (int i = 0; i <= NRP; i++) s = {s, $sformatf("%s%0d", (i > 0) ? "," : "", ts_d[i])};
+    s = {s, " dw="};
+    for (int i = 0; i <= NRP + 1; i++) s = {s, $sformatf("%s%0d", (i > 0) ? "," : "", ts_dw[i])};
+    s = {s, " rd="};
+    for (int i = 0; i < NRP; i++) s = {s, $sformatf("%s%0d", (i > 0) ? "," : "", ts_rd[i])};
+    s = {s, " rpl="};
+    for (int i = 0; i < NRP; i++) s = {s, $sformatf("%s%0d", (i > 0) ? "," : "", ts_rpl[i])};
+    $display("%s", s);
+  end
+
+  // The TMEM's accesses, cycle by cycle (docs/tmem_nocopy.md; +tmtrace=<file>, appended; S > 1:
+  // <file>.<sid>): records of three little-endian 32-bit words {cycle, info, value}, from reset
+  // to the halt. info[3:0] the kind, [7:4] the port or unit, [15:8] the lanes:
+  //   0 a read that happened (r_en), value lane 0's address (lane l reads value + l)
+  //   1 a write that happened (w_en), the same
+  //   2 / 3 a read / write lane of the MXU's ports (scattered lanes): one record per lane,
+  //     value its address
+  //   4 an instruction starts on unit [7:4]: [15:8] flags, [23:16] VOP func (w6[23:16]),
+  //     [31:24] opcode; value the sequencer's instruction count
+  //   5 an instruction completes on unit [7:4]
+  //   6 a unit asked for TMEM and was not granted: [15:8] a mask by group (DMA, COLL, VPU, MXU,
+  //     QUANT)
+  //   15 a simulation starts (cycle 0)
+  int     tt_fd;
+  longint tt_cyc;
+  initial begin
+    string fn;
+    tt_fd = 0;
+    tt_cyc = 0;
+    if ($value$plusargs("tmtrace=%s", fn)) begin
+      if (S > 1) fn = $sformatf("%s.%0d", fn, SID);
+      tt_fd = $fopen(fn, "ab");
+      if (tt_fd == 0) $fatal(1, "otpu_slice: cannot open %s", fn);
+      $fwrite(tt_fd, "%u%u%u", 32'd0, 32'd15, 32'd0);
+    end
+  end
+  /* verilator lint_off BLKSEQ */
+  always @(posedge clk) begin
+    tt_cyc <= tt_cyc + 1;
+    if (tt_fd != 0 && !srst && !halted) begin
+      logic [31:0] cy;
+      logic [NG-1:0] lg;
+      cy = 32'(tt_cyc);
+      for (int p = 0; p < NRP; p++)
+        if (|r_en[p]) begin
+          if (p == P_MXU) begin
+            for (int l = 0; l < LANES; l++)
+              if (r_en[p][l]) $fwrite(tt_fd, "%u%u%u", cy, {16'd0, 8'(1 << l), 4'(p), 4'd2}, r_addr[p][l]);
+          end else
+            $fwrite(tt_fd, "%u%u%u", cy, {16'd0, 8'(r_en[p]), 4'(p), 4'd0}, r_addr[p][0]);
+        end
+      for (int p = 0; p < NWP; p++)
+        if (|w_en[p]) begin
+          if (p == W_MXU) begin
+            for (int l = 0; l < LANES; l++)
+              if (w_en[p][l]) $fwrite(tt_fd, "%u%u%u", cy, {16'd0, 8'(1 << l), 4'(p), 4'd3}, w_addr[p][l]);
+          end else
+            $fwrite(tt_fd, "%u%u%u", cy, {16'd0, 8'(w_en[p]), 4'(p), 4'd1}, w_addr[p][0]);
+        end
+      for (int u = 0; u < NUNITS; u++) begin
+        if (ustart[u])
+          $fwrite(tt_fd, "%u%u%u", cy, {ucmd[u].op, ucmd[u].w6[23:16], ucmd[u].flags, 4'(u), 4'd4},
+                  sq_icount);
+        if (udone[u]) $fwrite(tt_fd, "%u%u%u", cy, {24'd0, 4'(u), 4'd5}, 32'd0);
+      end
+      lg = '0;
+      if (lose_mxu) lg[G_MXU] = 1'b1;
+      if (lose_q)   lg[G_Q] = 1'b1;
+      if (lose_vpu) lg[G_VPU] = 1'b1;
+      if (lose_col) lg[G_COLL] = 1'b1;
+      if (lg != '0) $fwrite(tt_fd, "%u%u%u", cy, {16'd0, 8'(lg), 4'd0, 4'd6}, 32'd0);
+    end
+  end
+  /* verilator lint_on BLKSEQ */
+  final if (tt_fd != 0) $fclose(tt_fd);
+`endif
 
   logic [31:0] win;                  // cycles per window
 `ifdef SYNTHESIS
@@ -636,8 +1175,8 @@ module otpu_slice
   logic [FW-1:0] af_r;
   assign ap = {lose_col, lose_vpu, lose_q, lose_mxu, mxu_pop, q_areq, mxu_areq, dma_breq,
                mxu_breq};
-  assign aq = {ld_busy && ld_req, mxu_block, mxu_starve, (a_req || q_awant) && !a_rdy,
-               b_req && !b_rdy};
+  assign aq = {ld_busy && ld_req, mxu_block, mxu_starve,
+               (mxu_areq && !a_rdy_i) || (q_awant && !sw_rdy_i), b_req_c && !b_rdy_i};
   logic [31:0] w_n, n_r;             // cycles of the current window before this one; last n
   logic        h_d, we_r, h_ev;      // halted a cycle ago; a window ended / the halt, last cycle
   logic [NP-1:0][31:0] sp;           // window sums, a cycle behind
@@ -670,6 +1209,8 @@ module otpu_slice
     pf.mac = ap_r[4];
     pf.starve = aq_r[2];
     pf.deny = |ap_r[8:5];
+    pf.bwait = bw_r;
+    pf.dwait = dw_r;
     pf.u_mxu = mxu_u;
     pf.u_mxu_v = mxu_uv;
     pf.u_q = q_u;
@@ -690,6 +1231,16 @@ module otpu_slice
   // board's trace buffer records (otpu_trace.sv, opentpu/hwtrace.py)
   bit trace;
   initial trace = $test$plusargs("trace");
+  // the MXU's scale reads (otpu_mxu xs_*; rtlsim stats["mxu_scale"]): port A line requests, and
+  // those that fetched a row's Sw alone
+  always @(posedge clk)
+    if (dump) $display("MXSCALE s%0d areq=%0d sw=%0d", SID, u_mxu.xs_a, u_mxu.xs_sw);
+  // the ACT RAM's reads (otpu_mxu xa_*; rtlsim stats["act_reads"]): cycles, column reads, pops,
+  // the columns of output rows at the pops, and the columns that ever read (a mask)
+  always @(posedge clk)
+    if (dump) $display("MXACT s%0d cyc=%0d rd=%0d pop=%0d use=%0d cols=%0d any=%0d", SID,
+                       u_mxu.xa_cyc, u_mxu.xa_rd, u_mxu.xa_pop, u_mxu.xa_use, MCOLS,
+                       64'(u_mxu.xa_any));
   always_ff @(posedge clk)
     if (trace) begin
       if (pf.sq.g) $display("T%0d G c=%0d s=%0d", SID, pf.sq.cyc, pf.sq.g_slot);

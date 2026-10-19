@@ -1,5 +1,6 @@
-// ACT RAM: the MXU's stationary operand. ROWS rows x BLOCKS blocks x D int8, plus one fp32
-// scale per (row, block). The quantizer writes up to LANES consecutive bytes (and one scale) per
+// ACT RAM: the MXU's stationary operand. ROWS rows x BLOCKS blocks x D int8, plus one 64-bit
+// scale record per (row, block): {da3, da2, da1, da0, Sa}, the row's fp32 Sa and the block's four
+// sub-block offsets (QACT, docs/isa.md "Quantization"). The quantizer writes up to LANES consecutive bytes (and one scale) per
 // cycle; its byte index is LANES aligned, so the bytes sit in one block. With `w_dup` (QACT DUP)
 // the bytes and the scale also go to row w_row + w_off (w_off: the QACT's row count; DUP rows
 // stay below MCOLS). The MXU reads one block of MCOLS rows per cycle: rows g*MCOLS ..
@@ -9,7 +10,7 @@
 // Block RAM: one memory per column j (rows j, j+MCOLS, ...) and piece p (bytes p*PB ..
 // p*PB+PB-1: four 64-bit block RAMs at PB = 32), GROUPS*BLOCKS words of PB bytes with byte
 // write enables, group-major. The read is registered (the MXU's first pipeline register) and
-// advances with `ren`; a read of a block written at the same edge returns the old bytes. Writes
+// advances with the column's `ren` bit (otpu_mxu: the columns of the MM's rows); a read of a block written at the same edge returns the old bytes. Writes
 // land three cycles after they are presented: the quantizer's write is registered as it arrives
 // and again (LANES bytes, their index and row, the scale), so it crosses from the quantizer in
 // that narrow form in two hops and the lane placement (LANES -> D bytes) starts at a flip-flop
@@ -35,15 +36,15 @@ module otpu_actram #(
   input  logic                   swe,
   input  logic [7:0]             s_row,
   input  logic [15:0]            s_blk,
-  input  logic [31:0]            s_data,
-  input  logic                   ren,
+  input  logic [63:0]            s_data,
+  input  logic [MCOLS-1:0]       ren,         // per column
   input  logic                   r_use,       // this edge's read is consumed (simulation checks)
   input  logic [15:0]            r_blk,
   input  logic [15:0]            r_blk2,
   input  logic [MCOLS-1:0]       r_hi,
   input  logic [7:0]             r_grp,
   output wire  [MCOLS*D*8-1:0]   r_data,      // row j at [j*D*8 +: D*8], byte i at [+8i]
-  output wire  [MCOLS*32-1:0]    r_scale
+  output wire  [MCOLS*64-1:0]    r_scale
 );
   localparam int BW = $clog2(BLOCKS);
   localparam int DW = $clog2(D);
@@ -82,7 +83,7 @@ module otpu_actram #(
   (* shreg_extract = "no" *) logic [LANES-1:0][7:0] w_data_i, w_data_h;
   (* shreg_extract = "no" *) logic                  w_dup_i, swe_i, w_dup_h, swe_h;
   (* shreg_extract = "no" *) logic [BW-1:0]         s_blk_i, s_blk_h;
-  (* shreg_extract = "no" *) logic [31:0]           s_data_i, s_data_h;
+  (* shreg_extract = "no" *) logic [63:0]           s_data_i, s_data_h;
   always_ff @(posedge clk) begin
     we_i <= we;
     w_row_i <= w_row;
@@ -114,7 +115,7 @@ module otpu_actram #(
   logic [MCOLS-1:0] ssel;
   logic [GW-1:0]    sg [MCOLS];
   logic [BW-1:0]    sb;
-  logic [31:0]      sd;
+  logic [63:0]      sd;
   // the placement register's inputs: per column, selected and the group of the row it writes
   logic [MCOLS-1:0] wsel_n, ssel_n;
   logic [GW-1:0]    wg_n [MCOLS], sg_n [MCOLS];
@@ -142,7 +143,7 @@ module otpu_actram #(
 `endif
 
   for (genvar j = 0; j < MCOLS; j++) begin : g_row
-    logic [31:0]    rs;
+    logic [63:0]    rs;
     wire [BW-1:0] rb = r_hi[j] ? r_blk2[BW-1:0] : r_blk[BW-1:0];
     wire [GW+BW-1:0] ra = (GROUPS > 1) ? {r_grp[GW-1:0], rb} : (GW+BW)'(rb);
     wire [GW+BW-1:0] sa = (GROUPS > 1) ? {sg[j], sb} : (GW+BW)'(sb);
@@ -163,16 +164,16 @@ module otpu_actram #(
       // the piece's bytes: a technology RAM with byte enables (rtl/tech)
       otpu_ram_1r1w_be #(.W(PB*8), .N(GROUPS*BLOCKS), .STYLE("auto")) u_act (
         .clk, .we(wsel), .wbe(wbe[p*PB +: PB]), .wa(wa[RAW-1:0]), .wd(wd[p*PB*8 +: PB*8]),
-        .re(ren), .ra(ra[RAW-1:0]), .rd);
+        .re(ren[j]), .ra(ra[RAW-1:0]), .rd);
       assign r_data[j*D*8 + p*PB*8 +: PB*8] = rd;
 `ifndef SYNTHESIS
       initial wsel = 1'b0;
 `endif
     end
-    // the column's block scales
-    otpu_ram_1r1w #(.W(32), .N(GROUPS*BLOCKS), .STYLE("auto")) u_asc (
-      .clk, .we(ssel[j]), .wa(sa[RAW-1:0]), .wd(sd), .re(ren), .ra(ra[RAW-1:0]), .rd(rs));
-    assign r_scale[j*32 +: 32] = rs;
+    // the column's block scale records
+    otpu_ram_1r1w #(.W(64), .N(GROUPS*BLOCKS), .STYLE("auto")) u_asc (
+      .clk, .we(ssel[j]), .wa(sa[RAW-1:0]), .wd(sd), .re(ren[j]), .ra(ra[RAW-1:0]), .rd(rs));
+    assign r_scale[j*64 +: 64] = rs;
 `ifndef SYNTHESIS
     // a consumed read of a block (or its scale) with a write in any register: it would return
     // the old bytes
@@ -185,7 +186,7 @@ module otpu_actram #(
     wire [GW+BW-1:0] wa_n = (GROUPS > 1) ? {wg_n[j], w_idx_h[DW +: BW]} : (GW+BW)'(w_idx_h[DW +: BW]);
     wire [GW+BW-1:0] sa_n = (GROUPS > 1) ? {sg_n[j], s_blk_h} : (GW+BW)'(s_blk_h);
     always @(posedge clk)
-      if (ren && r_use && ((g_pc[0].wsel && wa == ra) || (wsel_n[j] && wa_n == ra) ||
+      if (ren[j] && r_use && ((g_pc[0].wsel && wa == ra) || (wsel_n[j] && wa_n == ra) ||
                            (wsel_1 && wa_1 == ra) || (ssel[j] && sa == ra) ||
                            (ssel_n[j] && sa_n == ra) || (ssel_1 && sa_1 == ra)))
         $fatal(1, "otpu_actram: column %0d block %0d read while its write is in flight at %0t",

@@ -4,7 +4,9 @@
 //
 // wused counts the entries the write side still has to consider occupied: what it wrote minus
 // what the read side has popped as last seen through the synchronizer (so at most a few cycles
-// stale, always on the safe side). The channel bridge uses it for read credits.
+// stale, always on the safe side). The channel bridge uses it for read credits. rused counts the
+// entries the read side sees: the write pointer as synchronized minus what it has popped (as stale,
+// on the same safe side). The channel bridge batches XDMA's writes on it.
 //
 // OOO = 1: entries are written out of order, each at its slot (wslot: the entry's place in the
 // FIFO's order, modulo DEPTH), and enter the FIFO in slot order: the write pointer passes an entry
@@ -40,7 +42,8 @@ module otpu_afifo #(
   input  logic         rrst,
   output logic         rvalid,
   input  logic         rready,
-  output logic [W-1:0] rdata
+  output logic [W-1:0] rdata,
+  output logic [$clog2(DEPTH):0] rused
 );
   localparam int AW = $clog2(DEPTH);
   initial if (DEPTH != (1 << AW) || DEPTH < 4) $fatal(1, "otpu_afifo: DEPTH must be a power of two >= 4");
@@ -114,6 +117,7 @@ module otpu_afifo #(
   // read side
   assign rvalid = !rrst && (rgray != wgray_r2);
   assign rdata  = mem[rbin[AW-1:0]];
+  assign rused  = g2b(wgray_r2) - rbin;
   always_ff @(posedge rclk) begin
     if (rrst) begin
       rbin <= '0; rgray <= '0; wgray_r1 <= '0; wgray_r2 <= '0;

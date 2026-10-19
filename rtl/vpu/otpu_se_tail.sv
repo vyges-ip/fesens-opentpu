@@ -71,10 +71,13 @@ module otpu_se_tail
   input  logic             qo_v,
   input  f32_t             qo_d,
   // U (y = a*b + c*e) and Q (y = a*b + c) are also the VPU's composite stages (otpu_se_comp)
-  // in VOP mode (cm): generic stages, SL cen-cycles from the cycle their operands are presented
+  // in VOP mode: generic stages, SL cen-cycles from the cycle their operands are presented
   // (u_sel / q_sel) to u_y / q_y. Their units advance on cen (the VPU's enable, which is pe in
-  // stream mode) (docs/stream.md 11.2)
-  input  logic             cm,
+  // stream mode) (docs/stream.md 11.2). VOP mode comes as copies of one bit, two per lane (cm_u:
+  // U's operand registers, cm_q: Q's multiplier operands and partial loop), each its own
+  // flip-flop in otpu_vpu, so no one net reaches every lane's selects
+  input  logic [LANES-1:0] cm_u,
+  input  logic [LANES-1:0] cm_q,
   input  logic             cen,
   input  logic             u_sel,
   input  f32_t             u_a [LANES],
@@ -294,11 +297,10 @@ module otpu_se_tail
   wire   upad = c_pad && um.j[4:3] != '0;
   // U's and Q's units: on cen, with the composite's operands in VOP mode
   wire   ue = cen;
-  wire   uc = cm;
   for (genvar l = 0; l < L; l++) begin : g_u
     f32_t ra, rg, rc, re;
     always_ff @(posedge clk) if (ue) begin
-      if (uc) begin
+      if (cm_u[l]) begin
         ra <= u_a[l]; rg <= u_b[l]; rc <= u_c[l]; re <= u_e[l];
       end else begin
         ra <= ud[l]; rg <= upad ? F_ZERO : c_gcol ? gu[l] : gk; rc <= upad ? F_ZERO : d_row;
@@ -333,11 +335,11 @@ module otpu_se_tail
     always_ff @(posedge clk) if (ue) begin
       qa <= q_a[l]; qb <= q_b[l]; qc <= q_c[l]; qc2 <= qc;
     end
-    assign ma = uc ? qa : nw[l];
-    assign mb = uc ? qb : qy[l];
+    assign ma = cm_q[l] ? qa : nw[l];
+    assign mb = cm_q[l] ? qb : qy[l];
     otpu_fmul #(.LAT(LM)) u_m (.clk, .en(ue), .a(ma), .b(mb), .y(tq));
     otpu_delay #(.W(32), .N(RL - LA - 1)) u_fb (.clk, .en(ue), .d(pq[l]), .q(fbd));
-    always_ff @(posedge clk) if (ue) fbq <= uc ? qc2 : fq_e ? F_ZERO : fbd;
+    always_ff @(posedge clk) if (ue) fbq <= cm_q[l] ? qc2 : fq_e ? F_ZERO : fbd;
     assign prev = fbq;
     otpu_fadd #(.LAT(LA)) u_a (.clk, .en(ue), .a(prev), .b(tq), .y(pq[l]));
     assign q_y[l] = pq[l];

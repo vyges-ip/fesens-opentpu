@@ -2,11 +2,16 @@
 // collective, GATHER streams each slice's segment, up to LANES consecutive words per cycle, and
 // broadcasts it into the TMEM of all slices at dst + s*seg + r*drs + c; then all slices are
 // released together. `gnt` is the AND of every slice's TMEM grant; without it the unit holds.
+// RQ (TMEM's input stage, release r2, docs/tmem_nocopy.md 7): the reads go to the slices from a
+// request register (stage a), a cycle after they form, as every unit's do, and a read's data is
+// taken one granted cycle later than without it. For the slices' TMEMs on the unit's own ports
+// (otpu_top; otpu_board at S = 1); otpu_board's hub at S > 1 takes RQ 0 (the ports present).
 module otpu_coll
   import otpu_pkg::*;
 #(
   parameter int S     = 1,
-  parameter int LANES = 8
+  parameter int LANES = 8,
+  parameter bit RQ    = 1'b1
 ) (
   input  logic                            clk,
   input  logic                            rst,
@@ -54,6 +59,13 @@ module otpu_coll
   logic [LANES-1:0][31:0] qwl;
   logic [LANES-1:0]       qm;
   logic [LANES-1:0][31:0] qd;
+  // RQ: the request register (stage a): the read's slice, lanes and per-lane addresses, and its
+  // position (as, ar, acl) and write base (awa) for stage p
+  logic                   av;
+  logic [S-1:0]           asel;
+  logic [LANES-1:0]       am;
+  logic [LANES-1:0][31:0] aal;
+  logic [31:0]            as_, ar, acl, awa;
 
   always_comb begin
     ack = (st == C_ACK);
@@ -61,9 +73,9 @@ module otpu_coll
     w_en = '0; w_addr = '0; w_data = '0;
     for (int k = 0; k < S; k++)
       for (int l = 0; l < LANES; l++)
-        if (rd_on && ssel[k] && rm[l]) begin
+        if (RQ ? av && asel[k] && am[l] : rd_on && ssel[k] && rm[l]) begin
           r_en[k][l] = 1'b1;
-          r_addr[k][l] = ra + 32'(l);
+          r_addr[k][l] = RQ ? aal[l] : ra + 32'(l);
         end
     if (st == C_RUN && qv) begin
       for (int l = 0; l < LANES; l++)
@@ -93,6 +105,7 @@ module otpu_coll
       pv <= 1'b0;
       qv <= 1'b0;
       rd_on <= 1'b0;
+      av <= 1'b0;
     end else begin
       case (st)
         C_IDLE: if (&req) begin
@@ -112,6 +125,7 @@ module otpu_coll
             wrow <= cmds[0].w2; wseg <= cmds[0].w2;
             pv <= 1'b0;
             qv <= 1'b0;
+            av <= 1'b0;
             issuing <= 1'b1;
             rd_on <= 1'b1;
             st <= C_RUN;
@@ -124,10 +138,22 @@ module otpu_coll
           for (int l = 0; l < LANES; l++)
             for (int k = 0; k < S; k++) if (k == int'(ps)) qd[l] <= r_data[k][l];
           qlast <= pv && ps + 1 == S && pr + 1 == 32'(rows) && pcl + LANES >= 32'(cols);
-          pv <= issuing;
-          ps <= s; pr <= r; pcl <= c;
-          pwa <= wrow + c;
-          for (int l = 0; l < LANES; l++) pm[l] <= (c + 32'(l) < 32'(cols));
+          if (RQ) begin                                 // the read granted is stage a's
+            av <= issuing;
+            asel <= ssel; am <= rm;
+            for (int l = 0; l < LANES; l++) aal[l] <= ra + 32'(l);
+            as_ <= s; ar <= r; acl <= c;
+            awa <= wrow + c;
+            pv <= av;
+            ps <= as_; pr <= ar; pcl <= acl;
+            pwa <= awa;
+            pm <= am;                                   // (rm[l] is c + l < cols)
+          end else begin
+            pv <= issuing;
+            ps <= s; pr <= r; pcl <= c;
+            pwa <= wrow + c;
+            for (int l = 0; l < LANES; l++) pm[l] <= (c + 32'(l) < 32'(cols));
+          end
           if (issuing) begin
             logic [31:0] nc, nrrow;
             nc = c; nrrow = rrow;
@@ -187,6 +213,64 @@ module otpu_coll
         if (qwl[l] != qwa + 32'(l))
           $fatal(1, "otpu_coll: lane %0d's write address %0d is not %0d", l, qwl[l], qwa + 32'(l));
   end
+`endif
+endmodule
+
+// The collective unit without GATHER (otpu_board COLL_GATHER = 0, one slice only;
+// docs/infra_hunt.md 5): BAR as otpu_coll runs it (acknowledged two cycles after the request,
+// then a cycle cool-down), no TMEM access (its read and write ports tied off, so synthesis drops
+// the TMEM's collective write port). A GATHER is not run: it is acknowledged like a BAR, moves no
+// data, and raises gerr until reset (STATUS ERROR through otpu_board). The compiler never emits
+// GATHER at S = 1 (opentpu.language.all_gather), and the host refuses to load a program with one
+// on such a bitstream (CAPS2 bit0 = 0: opentpu/host/board.py). Ports as otpu_coll's, plus gerr.
+module otpu_coll_bar
+  import otpu_pkg::*;
+#(
+  parameter int S     = 1,
+  parameter int LANES = 8
+) (
+  input  logic                            clk,
+  input  logic                            rst,
+  input  logic [S-1:0]                    req,
+  input  cmd_t                            cmds [S],
+  input  logic                            gnt,
+  output logic                            ack,
+  output logic [S-1:0][LANES-1:0]         r_en,
+  output logic [S-1:0][LANES-1:0][31:0]   r_addr,
+  input  logic [S-1:0][LANES-1:0][31:0]   r_data,
+  output logic [LANES-1:0]                w_en,
+  output logic [LANES-1:0][31:0]          w_addr,
+  output logic [LANES-1:0][31:0]          w_data,
+  output logic                            gerr      // a GATHER came (sticky until rst)
+);
+  initial if (S != 1) $fatal(1, "otpu_coll_bar: one slice only (GATHER across slices needs otpu_coll)");
+  typedef enum logic [1:0] {C_IDLE, C_ACK, C_COOL} st_t;
+  st_t st;
+  assign ack    = (st == C_ACK);
+  assign r_en   = '0;
+  assign r_addr = '0;
+  assign w_en   = '0;
+  assign w_addr = '0;
+  assign w_data = '0;
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      st <= C_IDLE;
+      gerr <= 1'b0;
+    end else begin
+      case (st)
+        C_IDLE: if (&req) begin
+          st <= C_ACK;
+          if (cmds[0].op == OP_GATHER) gerr <= 1'b1;
+        end
+        C_ACK:  st <= C_COOL;
+        default: st <= C_IDLE;
+      endcase
+    end
+  end
+`ifndef SYNTHESIS
+  always @(posedge clk)
+    if (!rst && st == C_IDLE && &req && cmds[0].op == OP_GATHER && !$test$plusargs("coll_gerr_ok"))
+      $fatal(1, "otpu_coll_bar: GATHER on a collective unit without it (COLL_GATHER = 0)");
 `endif
 endmodule
 
@@ -332,7 +416,10 @@ module otpu_coll_port #(
   output logic                    gnt
 );
   localparam int PW = $clog2(F);         // F a power of two: the pointers wrap
-  logic                   hv, got;
+  // hq: hv's second cycle. The held read is asked from it (TMEM's input stage, release r2,
+  // docs/tmem_nocopy.md 7: every unit's read goes to TMEM a cycle after it forms, the writes a
+  // cycle after their grant), and held there until granted, with no replay
+  logic                   hv, hq, got;
   logic [LANES-1:0]       hm;
   logic [LANES-1:0][31:0] ha;
   logic [LANES-1:0]       fm [F];
@@ -343,7 +430,7 @@ module otpu_coll_port #(
   wire                    wtake = n != '0 && gnt_local;
 
   assign gnt = gnt_local;
-  assign coll_ren = hv ? hm : '0;
+  assign coll_ren = (hv && hq) ? hm : '0;
   assign coll_raddr = ha;
   assign coll_wen = n != '0 ? fm[rp] : '0;
   assign coll_waddr = fa[rp];
@@ -362,6 +449,7 @@ module otpu_coll_port #(
     end
     if (rst) begin
       hv <= 1'b0;
+      hq <= 1'b0;
       got <= 1'b0;
       dv <= 1'b0;
       pop <= 1'b0;
@@ -369,11 +457,12 @@ module otpu_coll_port #(
       rp <= '0;
       n <= '0;
     end else begin
-      got <= hv && gnt_local;
+      got <= hv && hq && gnt_local;
       dv <= got;
       pop <= wtake;
       if (rv) hv <= 1'b1;
-      else if (hv && gnt_local) hv <= 1'b0;
+      else if (hv && hq && gnt_local) hv <= 1'b0;
+      hq <= hv && !(hq && gnt_local);
       if (wv) wp <= wp + 1'b1;
       if (wtake) rp <= rp + 1'b1;
       n <= n + (PW+1)'(wv) - (PW+1)'(wtake);

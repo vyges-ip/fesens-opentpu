@@ -212,8 +212,13 @@ module otpu_dma
   cmd_t         sc;                                  // the DSTEP / STREAM
   logic         ds_dsc, ds_dsd, ds_su, ds_wait;
   logic [31:0]  dsw [8];                             // the STREAM's descriptor words
-  logic [2:0]   fr_k;                                // the fill step read last cycle (SF_*)
-  logic [4:0]   fr_i;
+  // TMEM's input stage (release r2, docs/tmem_nocopy.md 7): a read's data comes two cycles after
+  // its request forms (the request register, then the RAM), so the fill's tags pass fr_k0 and
+  // the run starts a cycle after the fill's last request (ds_fx), and a STREAM's descriptor is
+  // captured a cycle after its request leaves the register (ds_dw)
+  logic [2:0]   fr_k0, fr_k;                         // the fill step requested / read last cycle
+  logic [4:0]   fr_i0, fr_i;
+  logic         ds_fx, ds_dw;
   logic [$clog2(SPC > 1 ? SPC : 2)-1:0] ds_pos, pe_pos;   // segment within the chunk at rp
   (* max_fanout = 64 *) logic pe;
   logic         pe_in, pe_zero;
@@ -543,10 +548,11 @@ module otpu_dma
   // pp, pm, pl), and the chunk gathered so far in cb: the buffer's write data (st_cd) comes from
   // flip-flops, not from TMEM's block RAMs through its read path in the same cycle (the se-sys
   // build's TMEM port 1 -> lb DI paths, BRAM to BRAM, -0.38 ns). Both stages move with adv;
-  // while they hold, t_rdata holds too (no new read)
-  logic                   pa, pla;
-  int                     ppa;
-  logic [W-1:0]           pma;
+  // while they hold, t_rdata holds too (no new read). The segment whose request is in TMEM's
+  // input stage (the request register) is pa0's (release r2), the one read pa's.
+  logic                   pa0, pla0, pa, pla;
+  int                     ppa0, ppa;
+  logic [W-1:0]           pma0, pma;
   logic [W-1:0][31:0]     t_rq;
   logic                   st_pend, pl;
   (* max_fanout = 64 *) int pp;   // selects every data bit of b_wdata: replicated
@@ -561,9 +567,50 @@ module otpu_dma
   assign st_push = busy && is_st && !ackw && st_wr && adv;
   assign st_iss  = st_wq && b_gnt;
 
+  // TMEM's input stage (release r2, docs/tmem_nocopy.md 7): the read request (t_*_c) goes to
+  // TMEM from flip-flops, a cycle after it forms, moving with adv (a held request is asked
+  // again once adv returns); the stream fill's address (fs_k's lanes) and ST's segment
+  // arithmetic end at the register, not at the TMEM's ranks and pumped banks. t_rv is the
+  // pending request (it moves with adv, held while adv is low); t_re_q, what TMEM reads, is
+  // that request where adv will be up: adv_nx, adv a cycle ahead from its flip-flops' next
+  // values, so no adv gate sits between the register and TMEM (the r2 slice OOC's worst clk ->
+  // clk2x path: pl -> adv -> the gate -> the TMEM's ranks -> a pumped bank's address, 12 levels)
+  logic [LANES-1:0]       t_ren_c, t_rv, t_re_q;
+  logic [LANES-1:0][31:0] t_raddr_c;
+  // st_pend, pl and oc_nf move in the ST branch of the process below (st_pend and pl with adv,
+  // occ with the push and the issue); a start clears st_pend; elsewhere st_pend is low, so adv
+  // stays up
+  logic       adv_nx;
+  logic [1:0] oc_st;
+  always_comb begin
+    oc_st = oc_nx(occ, st_push, st_iss);
+    if (rst || start) adv_nx = 1'b1;
+    else if (!ackw && busy && is_st)
+      adv_nx = !((adv ? pa : st_pend) && (adv ? pla : pl)) || oc_st[1];
+    else adv_nx = adv;
+  end
+  always_ff @(posedge clk)
+    if (rst) begin t_rv <= '0; t_re_q <= '0; end
+    else begin
+      if (adv) begin t_rv <= t_ren_c; t_raddr <= t_raddr_c; end
+      t_re_q <= adv_nx ? (adv ? t_ren_c : t_rv) : '0;
+    end
+  assign t_ren = t_re_q;
+`ifndef SYNTHESIS
+  // the prediction is adv, and TMEM reads the pending request exactly while adv is up
+  logic adv_q;
+  bit   adv_rst;
+  initial adv_rst = 1'b0;
+  always @(posedge clk) begin
+    adv_q <= adv_nx;
+    if (rst) adv_rst <= 1'b1;
+    if (!rst && adv_rst && (adv_q != adv || t_re_q != (adv ? t_rv : '0)))
+      $fatal(1, "otpu_dma: adv %0d predicted %0d, read %b of pending %b", adv, adv_q, t_re_q, t_rv);
+  end
+`endif
   always_comb begin
     b_req = ld_req; b_we = 1'b0; b_addr = ic;
-    t_ren = '0; t_raddr = '0;
+    t_ren_c = '0; t_raddr_c = '0;
     for (int p = 0; p < SPC; p++)
       for (int l = 0; l < W; l++) begin
         st_cm[p * W + l] = cbm[p * W + l] || (pp == p && pm[l]);
@@ -583,13 +630,13 @@ module otpu_dma
     end
     if (ds_fill)
       for (int l = 0; l < W; l++) begin
-        t_ren[l] = fk_m[l];
-        t_raddr[l] = fk_a + 32'(l);
+        t_ren_c[l] = fk_m[l];
+        t_raddr_c[l] = fk_a + 32'(l);
       end
     if (ds_dsc)                           // a STREAM's descriptor
       for (int l = 0; l < W; l++) begin
-        t_ren[l] = 1'b1;
-        t_raddr[l] = 32'(sc.w1[15:0]) + 32'(l);
+        t_ren_c[l] = 1'b1;
+        t_raddr_c[l] = 32'(sc.w1[15:0]) + 32'(l);
       end
     if (busy && is_st && !ackw) begin
       b_addr = ic;
@@ -599,15 +646,17 @@ module otpu_dma
       end
       if (st_rd)
         for (int l = 0; l < W; l++) begin
-          t_ren[l] = sm[l];
-          t_raddr[l] = so + 32'(l);
+          t_ren_c[l] = sm[l];
+          t_raddr_c[l] = so + 32'(l);
         end
     end
   end
 
   always_ff @(posedge clk) begin
-    fr_k <= rst ? SF_NONE : fk_k;
-    fr_i <= fk_i;
+    fr_k0 <= rst ? SF_NONE : fk_k;
+    fr_i0 <= fk_i;
+    fr_k <= rst ? SF_NONE : fr_k0;
+    fr_i <= fr_i0;
     pe <= !rst && (ds_take || ds_drain);
     pe_in <= ds_take;
     pe_zero <= ds_zero || ds_spad;
@@ -639,13 +688,14 @@ module otpu_dma
       ld_fin <= 1'b0;
       dv_v <= 1'b0;
       busy <= 1'b0;
-      st_pend <= 1'b0; pa <= 1'b0;
+      st_pend <= 1'b0; pa <= 1'b0; pa0 <= 1'b0;
       st_wq <= 1'b0;
       ackw <= 1'b0;
       ds_wr <= 1'b0;
       ds_rr <= 1'b0;
       ds_dsc <= 1'b0; ds_dsd <= 1'b0; ds_su <= 1'b0; ds_wait <= 1'b0;
       ds_fill <= 1'b0; ds_run <= 1'b0; ds_out <= 1'b0;
+      ds_fx <= 1'b0; ds_dw <= 1'b0;
       ss_req <= 1'b0;
       is_ww <= 1'b0; ww_c1 <= 1'b0; ww_c2 <= 1'b0; ww_sl <= 1'b0; ww_late <= 1'b0; err <= 1'b0;
     end else if (start && (cmd.op == OP_DSTEP || cmd.op == OP_STREAM)) begin
@@ -658,9 +708,10 @@ module otpu_dma
       ds_ycnt <= '0; ds_ocnt <= '0; ds_wch <= '0;
       ds_dsc <= cmd.op == OP_STREAM; ds_dsd <= 1'b0; ds_su <= cmd.op == OP_DSTEP;
       ds_wait <= 1'b0; ds_fill <= 1'b0; ds_run <= 1'b0; ds_out <= 1'b0;
+      ds_fx <= 1'b0; ds_dw <= 1'b0;
       og <= '0; gt <= '0; gh <= '0; ds_pos <= '0; oi <= '0; ds_wr <= 1'b0;
       ds_rr <= 1'b0; ds_rc <= '0;
-      st_pend <= 1'b0; pa <= 1'b0;
+      st_pend <= 1'b0; pa <= 1'b0; pa0 <= 1'b0;
       ackw <= 1'b0;
       busy <= 1'b1;
     end else if (start) begin
@@ -687,7 +738,7 @@ module otpu_dma
       nc = (n + (oc + (CW - 1))) >> CWL;
       cleft <= nc; cl_nz <= nc != 0; cl_one <= nc == 1;
       occ <= '0; {oc_nf, oc_lr} <= oc_of('0); cnt <= '0; wp <= '0; rp <= '0;
-      st_pend <= 1'b0; pa <= 1'b0;
+      st_pend <= 1'b0; pa <= 1'b0; pa0 <= 1'b0;
       st_wq <= 1'b0;
       st_fin <= 1'b0;
       cbm <= '0;
@@ -706,6 +757,10 @@ module otpu_dma
         // a STREAM's descriptor: read, then captured (dsw)
         if (ds_dsc) begin
           ds_dsc <= 1'b0;
+          ds_dw <= 1'b1;
+        end
+        if (ds_dw) begin
+          ds_dw <= 1'b0;
           ds_dsd <= 1'b1;
         end
         if (ds_dsd) begin
@@ -740,6 +795,10 @@ module otpu_dma
         end
         if (ds_fill && fs_k == SF_NONE) begin
           ds_fill <= 1'b0;
+          ds_fx <= 1'b1;
+        end
+        if (ds_fx) begin
+          ds_fx <= 1'b0;
           ds_run <= 1'b1;
         end
         if (ds_take) begin
@@ -871,11 +930,15 @@ module otpu_dma
           pm <= pma;
           pl <= pla;
           t_rq <= t_rdata;
-          pa <= st_rd;
-          ppa <= pos_of(sw);
-          pma <= sm;
-          pla <= seg_end;
-          if (st_pend && !pa && !sl_nz) begin     // the last chunk goes into the buffer
+          pa0 <= st_rd;
+          ppa0 <= pos_of(sw);
+          pma0 <= sm;
+          pla0 <= seg_end;
+          pa <= pa0;
+          ppa <= ppa0;
+          pma <= pma0;
+          pla <= pla0;
+          if (st_pend && !pa && !pa0 && !sl_nz) begin     // the last chunk goes into the buffer
             st_pend <= 1'b0;
             st_fin <= 1'b1;
           end

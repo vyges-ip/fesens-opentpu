@@ -90,6 +90,9 @@ module otpu_vpu
                                                // the head write is taken)
   output logic                    ren,        // the lanes take the read data (WBUF: the
                                                // registered enable; else the grant)
+  input  logic                    rhold,      // WBUF: a read of this cycle lost its TMEM RAM
+                                               // (otpu_tmem RPL): hold the next cycle while it
+                                               // is read again
   output logic [LANES-1:0]        ta_en,
   output logic [LANES-1:0][31:0]  ta_addr,
   input  logic [LANES-1:0][31:0]  ta_data,
@@ -212,7 +215,17 @@ module otpu_vpu
     t = base + AW'(c) + AW'(l);
     return 32'(t);
   endfunction
-  wire [15:0] iwid = comp_f(func) ? 16'(NCL) : 16'(LANES);   // columns issued per cycle
+  // composite columns a chunk: NCL; in simulation +vt_cw=W issues W (a composite path W lanes
+  // wide at today's latency: docs/seq_vpu.md, EXPERIMENTAL)
+  logic [15:0] cwid;
+`ifndef SYNTHESIS
+  int vt_cw = NCL;
+  initial void'($value$plusargs("vt_cw=%d", vt_cw));
+  assign cwid = 16'(vt_cw);
+`else
+  assign cwid = 16'(NCL);
+`endif
+  wire [15:0] iwid = comp_f(func) ? cwid : 16'(LANES);   // columns issued per cycle
 
   // C8: otpu_se_comp, whose stages are slot 0 (s = 0) and the tail's U (1) and Q (2). A
   // composite chunk is not issued while comp says slot 0 is taken when it would get there
@@ -225,7 +238,37 @@ module otpu_vpu
   f32_t             c_ia [LANES], c_ib [LANES], c_od [LANES];
   logic [LANES-1:0] c_om;
   logic [AW:0]      c_ometa;                   // {waddr, all_last}
-  wire              iss_ok = !(C8 && comp_f(func) && c_hold);
+  // EXPERIMENTAL (docs/seq_vpu.md), simulation only: a narrower vector path at today's latency.
+  // +vt_ew=N / +vt_comp=N: an elementwise / composite chunk issues on one enabled cycle in N
+  // (a path 1/N as wide; for the composites +vt_cw above is the exact model, this a gap at
+  // issue that the composite loop's schedule may partly absorb); +vt_red=N: while a reduction
+  // runs, the VPU advances on one cycle in N (its bubbles would break the partial loop's
+  // schedule, so the whole VPU waits). Defaults 1.
+  logic             iss_thr;                   // the chunk may issue this cycle
+  logic             red_thr;                   // the VPU may advance this cycle (a reduction's)
+`ifndef SYNTHESIS
+  int vt_ew = 1, vt_comp = 1, vt_red = 1;
+  int vt_c = 0, vt_r = 0;
+  initial begin
+    void'($value$plusargs("vt_ew=%d", vt_ew));
+    void'($value$plusargs("vt_comp=%d", vt_comp));
+    void'($value$plusargs("vt_red=%d", vt_red));
+  end
+  always_comb begin
+    int n;
+    n = is_reduce(func) ? 1 : comp_f(func) ? vt_comp : vt_ew;
+    iss_thr = (n <= 1) || (vt_c % n == 0) || filling;
+    red_thr = (vt_red <= 1) || !red_act || (vt_r % vt_red == 0);
+  end
+  always @(posedge clk) begin
+    if (en && issuing) vt_c <= vt_c + 1;
+    if (red_act) vt_r <= vt_r + 1;
+  end
+`else
+  assign iss_thr = 1'b1;
+  assign red_thr = 1'b1;
+`endif
+  wire              iss_ok = !(C8 && comp_f(func) && c_hold) && iss_thr;
 
   wire is_sum = (func == V_RSUM) || (func == V_RSSQ) || (func == V_RDOT);
   wire is_am = (func == V_ARGMAX);
@@ -253,6 +296,9 @@ module otpu_vpu
   // tail's X registers (s_xd, s_xa, s_xm), and s_xm at slot 0's pacc (s_mt)
   (* max_fanout = 64 *) logic sen;
   logic       ss_act_d;                        // ss_act's next value
+  // ss_act's copies, three per lane (see g_sar): the lane's RDOT term (sa_r), the tail's U
+  // operand registers and Q multiplier operands (cm_u, cm_q: its complement)
+  logic [LANES-1:0] sa_r, cm_u, cm_q;
   logic       s_init, s_in_v, s_first;
   f32_t       s_in_d [LANES], s_fd [LANES], s_xd [LANES], s_xa [LANES];
   logic [2:0] s_fk;
@@ -285,21 +331,33 @@ module otpu_vpu
   // is, so the lane tests (ic + l < cols, the issue checks) reach the enables but not the
   // addresses, and TMEM's bank addresses no longer wait for them (133.33 MHz, fused-133
   // c2830d6: cols -> the lane test -> tb_en -> the address multiplexer -> port 4's bank rows
-  // -> block RAM ADDRB, 9-10 levels, +0.130 ns)
+  // -> block RAM ADDRB, 9-10 levels, +0.130 ns).
+  // TMEM's input stage (release r2, docs/tmem_nocopy.md 7): the request (ta_/tb_*_c) goes to
+  // TMEM from flip-flops, a cycle after it is formed, advancing with the enable: the chunk's
+  // address arithmetic, its lane tests and the issue checks end at the register, not at the
+  // TMEM's ranks and pumped banks (r2m4: cols / ic -> the request address -> the pump banks'
+  // read pins, clk -> clk2x, 55% of its TNS). The chunk (mi) waits a cycle in mi2 for it.
+  logic [LANES-1:0]       ta_en_c, tb_en_c;
+  logic [LANES-1:0][31:0] ta_addr_c, tb_addr_c;
+  always_ff @(posedge clk)
+    if (rst) begin ta_en <= '0; tb_en <= '0; end
+    else if (en) begin
+      ta_en <= ta_en_c; tb_en <= tb_en_c; ta_addr <= ta_addr_c; tb_addr <= tb_addr_c;
+    end
   logic [LANES-1:0] imask;
   logic             irow_last, iall_last;
   always_comb begin
-    ta_en = '0; tb_en = '0;
+    ta_en_c = '0; tb_en_c = '0;
     imask = '0;
     irow_last = (ch + 1 == nch);
     iall_last = irow_last && (ir + 1 == rows);
     for (int l = 0; l < LANES; l++) begin
       if (filling) begin
-        ta_addr[l] = od_sc ? 32'(od_a) : tm_addr(od_a, ic, l);
-        tb_addr[l] = tm_addr(oc_a, ic, l);
+        ta_addr_c[l] = od_sc ? 32'(od_a) : tm_addr(od_a, ic, l);
+        tb_addr_c[l] = tm_addr(oc_a, ic, l);
       end else begin
-        ta_addr[l] = tm_addr(a_row, ic, l);
-        tb_addr[l] = (bmode == B_COL) ? tm_addr(b, ic, l) :
+        ta_addr_c[l] = tm_addr(a_row, ic, l);
+        tb_addr_c[l] = (bmode == B_COL) ? tm_addr(b, ic, l) :
                      (bmode == B_ROW && l == 0) ? 32'(b_row) : tm_addr(b_row, ic, l);
       end
     end
@@ -307,19 +365,19 @@ module otpu_vpu
       // OUTER fill: C on port B; D on port A (one word on lane 0 for DSCALAR, none for DONE)
       for (int l = 0; l < LANES; l++) begin
         if (32'(ic) + 32'(l) < 32'(cols)) begin
-          tb_en[l] = 1'b1;
-          if (!od_one && (!od_sc || l == 0)) ta_en[l] = 1'b1;
+          tb_en_c[l] = 1'b1;
+          if (!od_one && (!od_sc || l == 0)) ta_en_c[l] = 1'b1;
         end
       end
     end else if (issuing && iss_ok) begin
       for (int l = 0; l < LANES; l++) begin
         if (32'(ic) + 32'(l) < 32'(cols) && 16'(l) < iwid) begin
           imask[l] = 1'b1;
-          ta_en[l] = (func != V_FILL);
-          if (reads_b(func) && (bmode == B_FULL || bmode == B_COL)) tb_en[l] = 1'b1;
+          ta_en_c[l] = (func != V_FILL);
+          if (reads_b(func) && (bmode == B_FULL || bmode == B_COL)) tb_en_c[l] = 1'b1;
         end
       end
-      if (bmode == B_ROW && reads_b(func) && imask[0]) tb_en[0] = 1'b1;
+      if (bmode == B_ROW && reads_b(func) && imask[0]) tb_en_c[0] = 1'b1;
     end
   end
 `ifndef SYNTHESIS
@@ -332,7 +390,7 @@ module otpu_vpu
         rb = filling ? tm_addr(oc_a, ic, l) :
              (bmode == B_FULL) ? tm_addr(b_row, ic, l) :
              (bmode == B_COL) ? tm_addr(b, ic, l) : 32'(b_row);
-        if ((ta_en[l] && ta_addr[l] != ra) || (tb_en[l] && tb_addr[l] != rb))
+        if ((ta_en_c[l] && ta_addr_c[l] != ra) || (tb_en_c[l] && tb_addr_c[l] != rb))
           $fatal(1, "otpu_vpu: lane %0d's read address is not its mode's", l);
       end
 `endif
@@ -357,10 +415,12 @@ module otpu_vpu
     logic [CBW-1:0]   cb;        // OUTER: the column-buffer word of the chunk (chunk in row)
     logic [15:0]      col;       // the chunk's first column (ARGMAX's index)
   } meta_t;
-  // mi: the chunk read this cycle; m0: that chunk one granted cycle later, together with its
-  // TMEM data registered (xa, xb), so no path runs from the TMEM block RAMs into the lanes'
+  // mi: the chunk whose read request forms this cycle; mi2: that chunk with its request in the
+  // request register (TMEM reads it then); m0: the chunk one granted cycle later, together with
+  // its TMEM data registered (xa, xb), so no path runs from the TMEM block RAMs into the lanes'
   // multipliers in one cycle
-  meta_t m0, mi;
+  meta_t m0, mi, mi2;
+  always_ff @(posedge clk) if (rst) mi2 <= '0; else if (en) mi2 <= mi;
   logic [LANES-1:0][31:0] xa, xb;
   f32_t xc [LANES], xd [LANES];               // OUTER: C(c), D(c) from the buffers, with xa/xb
   // stream mode: m0 is an RDOT with no chunk (slot 0 on the partial loop, fed by the tail)
@@ -396,8 +456,8 @@ module otpu_vpu
       m0 <= '0;
       m0d <= fdec(8'd0);
     end else if (en) begin
-      m0 <= (SE && ss_act) ? M_SS : mi;
-      m0d <= fdec((SE && ss_act) ? M_SS.func : mi.func);
+      m0 <= (SE && ss_act) ? M_SS : mi2;
+      m0d <= fdec((SE && ss_act) ? M_SS.func : mi2.func);
       xa <= ta_data;
       xb <= tb_data;
     end
@@ -417,8 +477,8 @@ module otpu_vpu
         cbuf[m0.cb] <= xb[l];
         dbuf[m0.cb] <= od_one ? F_ONE : od_sc ? xa[0] : xa[l];
       end
-      xc[l] <= cbuf[mi.cb];
-      xd[l] <= dbuf[mi.cb];
+      xc[l] <= cbuf[mi2.cb];
+      xd[l] <= dbuf[mi2.cb];
     end
   end
 
@@ -847,7 +907,7 @@ module otpu_vpu
     assign sy[0] = c_s0y;
     assign sy[1] = c_uy;
     assign sy[2] = c_qy;
-    otpu_se_comp #(.LANES(LANES), .MW(AW + 1), .NS(CNS), .HA(2), .EXT(1'b1)) u_comp (
+    otpu_se_comp #(.LANES(LANES), .MW(AW + 1), .NS(CNS), .HA(3), .EXT(1'b1)) u_comp (
       .clk, .rst, .en, .in_v(m0.v && m0d.cf), .in_c(m0d.cc), .in_a(c_ia),
       .in_b(c_ib), .in_m(m0.mask), .in_meta({m0.waddr, m0.all_last}), .hold(c_hold),
       .st_sel(c_sel), .st_a(c_sa), .st_b(c_sb), .st_c(c_sc), .st_e(c_se), .st_y(sy),
@@ -991,17 +1051,17 @@ module otpu_vpu
     assign sb = m0.sq ? sa : (m0.dot && m0.mask[l]) ? yb : F_ONE;
     // stream mode: the term is the tail's S * a (bubbles come only after the last row, and
     // their partials are never captured)
-    assign rsa[l] = (SE && ss_act) ? s_xd[l] : sa;
-    assign rsb[l] = (SE && ss_act) ? s_xa[l] : sb;
+    assign rsa[l] = (SE && sa_r[l]) ? s_xd[l] : sa;
+    assign rsb[l] = (SE && sa_r[l]) ? s_xa[l] : sb;
     // pacc(chunk c) = pacc(chunk c - RL) + term(c): a loop of exactly RL cycles
     if (RMA) begin : g_ma
       // through slot 0's u_ma (term + prev: the add is commutative bit for bit), fed back by
       // fbq, which slot 0 reads (as c) the cycle after it's written: cleared on the chunks that
-      // are on m0 then (mi), the first ones' +0. rc keeps the adder's c off a shift register.
-      // A stream clears c instead, on its X segment's first flag (mi is idle then).
+      // are on m0 then (mi2), the first ones' +0. rc keeps the adder's c off a shift register.
+      // A stream clears c instead, on its X segment's first flag (mi2 is idle then).
       f32_t fbq, fbd;
       otpu_delay #(.W(32), .N(DF - 1)) u_fb (.clk, .en, .d(pacc[l]), .q(fbd));
-      always_ff @(posedge clk) if (en) fbq <= mi.first ? F_ZERO : fbd;
+      always_ff @(posedge clk) if (en) fbq <= mi2.first ? F_ZERO : fbd;
       assign rfb[l] = s_first ? F_ZERO : fbq;
     end else begin : g_acc
       f32_t tq, prev;
@@ -1171,10 +1231,10 @@ module otpu_vpu
         end
         wn <= wn_nx;
         if (SE) begin
-          en_q <= ss_act_d ? ss_pe : pop ? (wn_p1 < 2) : (wn_p0 < 2);  // a stream: its pe (as sen)
-          en_r <= en_q;
+          en_q <= ss_act_d ? ss_pe : (pop ? (wn_p1 < 2) : (wn_p0 < 2)) && red_thr;  // a stream: its pe (as sen)
+          en_r <= en_q && !rhold;
         end else begin
-          en_r <= pop ? (wn_p1 < 2) : (wn_p0 < 2);
+          en_r <= (pop ? (wn_p1 < 2) : (wn_p0 < 2)) && red_thr && !rhold;
         end
         done <= pop && hd.dn;
         dpend <= pdn && !en;
@@ -1261,6 +1321,22 @@ module otpu_vpu
       s_cfg <= ss_cfg;
     end
     assign ss_gnt = ss_act;
+    // ss_act's copies for the lanes: ss_act selects every lane's RDOT term (64 selects a lane)
+    // and the tail's VOP-mode operands (224 a lane), and as one flip-flop (the card's ASIC point,
+    // tm100: through 190 buffers to some 2,700 endpoints, its complement 10 buffers deep into
+    // the tail's multiplier selects, the worst register path) only Vivado replicated it (its
+    // max_fanout). Each copy is loaded with ss_act's next value, so it equals ss_act (cm_*: its
+    // complement) in the same cycle, and is an instance of its own (kept: identical flip-flops
+    // would be merged into one again)
+    wire sa_n = !rst && ss_act_d;
+    for (genvar l = 0; l < LANES; l++) begin : g_sar
+      (* keep_hierarchy = "yes" *)
+      otpu_delay #(.W(1), .N(1)) u_sa (.clk, .en(1'b1), .d(sa_n), .q(sa_r[l]));
+      (* keep_hierarchy = "yes" *)
+      otpu_delay #(.W(1), .N(1)) u_cu (.clk, .en(1'b1), .d(!sa_n), .q(cm_u[l]));
+      (* keep_hierarchy = "yes" *)
+      otpu_delay #(.W(1), .N(1)) u_cq (.clk, .en(1'b1), .d(!sa_n), .q(cm_q[l]));
+    end
     // the tail's X meta, aligned with slot 0's pacc (as mt is for a reduction): u_vt's cap
     otpu_delay #(.W($bits(ss_meta_t)), .N(TA)) u_smt (.clk, .en, .d(s_xm), .q(s_mt));
     assign s_first = ss_act && s_xm.first;
@@ -1273,7 +1349,7 @@ module otpu_vpu
       .kv(root), .kv_v(root_v && !vt_q), .y_v(t_yv), .y_d(ss_y_d), .o_v(t_ov), .o_d(ss_o_d),
       .qp_cap(t_qc), .qp_row_last(t_qrl), .qp_sub(t_qsub), .qp_d(t_qd),
       .qo_v(root_v && vt_q), .qo_d(root_o),
-      .cm(!ss_act), .cen(en), .u_sel(c_sel[1]), .u_a(c_sa[1]), .u_b(c_sb[1]), .u_c(c_sc[1]),
+      .cm_u, .cm_q, .cen(en), .u_sel(c_sel[1]), .u_a(c_sa[1]), .u_b(c_sb[1]), .u_c(c_sc[1]),
       .u_e(c_se[1]), .u_y(c_uy), .q_sel(c_sel[2]), .q_a(c_sa[2]), .q_b(c_sb[2]), .q_c(c_sc[2]),
       .q_y(c_qy));
     // Q's partials registered here (QD = 1: the tail pads its Q path for it), so no path
@@ -1309,6 +1385,9 @@ module otpu_vpu
     assign vt_q = 1'b0;
     assign ss_act = 1'b0;
     assign ss_gnt = 1'b0;
+    assign sa_r = '0;
+    assign cm_u = '1;
+    assign cm_q = '1;
     assign sen = 1'b0;
     assign s_init = 1'b0;
     assign s_first = 1'b0;
@@ -1367,7 +1446,11 @@ module otpu_vpu
           imm <= hc.w7;
           nslots <= n_slots(hf);
           c16 = hc.w4[31:16];
+`ifndef SYNTHESIS
+          nchunks = comp_f(hf) ? (c16 + cwid - 1) / cwid : (c16 + 16'(LANES) - 1) >> LW;
+`else
           nchunks = comp_f(hf) ? (c16 + 16'(NCL) - 1) >> CLW : (c16 + 16'(LANES) - 1) >> LW;
+`endif
           if (hf == V_RSUM || hf == V_RSSQ || hf == V_RDOT)
             nchunks = ((nchunks + 16'(RL) - 1) / 16'(RL)) * 16'(RL);
           nch <= nchunks;

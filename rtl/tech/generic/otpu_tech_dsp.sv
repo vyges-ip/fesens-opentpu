@@ -41,28 +41,49 @@ module otpu_pe #(parameter bit FIRST = 1'b0, parameter bit LAST = 1'b0, paramete
 endmodule
 
 
-// The systolic MXU's column end (IMPL 2): per sub-block b the chains' ends a[b] and d[b] (the
-// LAST positions' unregistered sums) are registered with m_b (mb[4b+3:4b], unsigned), summed and
-// multiplied into v[b]; one cycle later s = v0 + v1 + v2 + v3 (its low SW bits). Exact: every
-// value fits 48 bits. rtl/tech/xilinx7 maps it onto four cascaded DSP48E1s.
-module otpu_colend #(parameter int SW = 23) (
-  input  logic                 clk,
-  input  logic                 en,
-  input  logic [3:0][23:0]     a,        // sub-block b's chain ends: the pre-adder's A ...
-  input  logic [3:0][23:0]     d,        // ... and D (signed)
-  input  logic [15:0]          mb,       // m_3 .. m_0, with a / d
-  output logic signed [SW-1:0] s
+// The MX column end (otpu_mxu, docs/mx_mxu.md): a column's eight group sums, each one chain end
+// (a[g], the LAST position's unregistered sum) or, at two chains a group (CPG 2), two (a[g] +
+// d[g]), times the group's B = m << sh (bm[g], unsigned, < 2^17), summed and accumulated over the
+// row's blocks into one 48-bit integer:
+//   acc = (first ? 0 : acc) + sum_g (a[g] + d[g]) * bm[g]
+// Edges from E, the one that registers a / d / bm: groups 0..3 multiply at E+1 and are summed at
+// E+2 (p3); groups 4..7 register their pre-adder's sum and B again at E+1, multiply at E+2 and
+// join p3 at E+3 (p7); the accumulator adds p7 at E+4. first is registered at E+3 (two cycles
+// after its block's a / d / bm), as the accumulator's OPMODE. Exact: |a + d| < 2^24, the
+// products < 2^41 and a row's sum < 2^47 (docs/isa.md MM). rtl/tech/xilinx7 maps it onto nine
+// DSP48E1s (eight multipliers on two cascades, one accumulator).
+module otpu_mxce #(parameter int CPG = 1) (
+  input  logic                clk,
+  input  logic [7:0][23:0]    a,        // group g's chain end: the pre-adder's A ...
+  input  logic [7:0][23:0]    d,        // ... and D (CPG 2: the group's second chain; else unused)
+  input  logic [7:0][16:0]    bm,       // B = m << sh, with a / d
+  input  logic                first,    // the row's first block (two cycles after a / d / bm)
+  output logic [47:0]         acc
 );
-  // the DSP48E1's pre-adder is 25 bits wide (rtl/tech/xilinx7): every technology takes the same
-  // parameters
-  initial if (SW > 25) $fatal(1, "otpu_colend: SW %0d > 25", SW);
-  logic [3:0][23:0] ar, dr;
-  logic [15:0] mr;
-  logic signed [47:0] v [4];
-  always_ff @(posedge clk) if (en) begin
-    ar <= a; dr <= d; mr <= mb;
-    for (int b = 0; b < 4; b++)
-      v[b] <= (48'($signed(ar[b])) + 48'($signed(dr[b]))) * 48'(mr[4*b +: 4]);
-    s <= SW'(v[0] + v[1] + v[2] + v[3]);
+  initial if (CPG != 1 && CPG != 2) $fatal(1, "otpu_mxce: CPG %0d", CPG);
+  logic [7:0][23:0] ar, dr;
+  logic [7:0][16:0] br;
+  logic [7:4][24:0] adr;                   // groups 4..7: the pre-adder's register (ADREG) ...
+  logic [7:4][16:0] br2;                   // ... and B's second register
+  logic [7:0][47:0] m;
+  logic [47:0]      p3, p7;
+  logic             fr;
+  // 25 bits, as the DSP48E1's pre-adder
+  function automatic logic [24:0] pre(input logic [23:0] x, input logic [23:0] y);
+    return {x[23], x} + {y[23], y};
+  endfunction
+  always_ff @(posedge clk) begin
+    ar <= a; dr <= (CPG == 2) ? d : '0; br <= bm;
+    for (int g = 0; g < 4; g++)
+      m[g] <= 48'($signed(pre(ar[g], dr[g]))) * 48'($signed({1'b0, br[g]}));
+    for (int g = 4; g < 8; g++) begin
+      adr[g] <= pre(ar[g], dr[g]);
+      br2[g] <= br[g];
+      m[g] <= 48'($signed(adr[g])) * 48'($signed({1'b0, br2[g]}));
+    end
+    p3 <= m[0] + m[1] + m[2] + m[3];
+    p7 <= p3 + m[4] + m[5] + m[6] + m[7];
+    fr <= first;
+    acc <= (fr ? 48'd0 : acc) + p7;
   end
 endmodule

@@ -22,14 +22,31 @@ module otpu_top
   parameter int WIN        = 32,
   parameter int RPB        = 4,
   parameter int WPB        = 2,
-  parameter int MXU_IMPL   = 0,
+  parameter int MXU_IMPL   = 2,
   parameter int MXU_CL     = 16,
+  parameter int MXU_E      = 0,       // MXU epilogue lanes (0: MCOLS / 2; otpu_mxu E)
+  parameter int QUANT_XD   = 1024,    // quantizer row buffer chunks (0: two passes over TMEM; otpu_quant XD)
   parameter int VPU_CL     = (LANES >= 8) ? LANES / 4 : 1,
   parameter int ULANES     = LANES,   // TMEM lanes of the MXU and the quantizer
   parameter int AXI        = 0,       // memory path: see the top
-  parameter int TMEM_IMPL  = 0        // TMEM: 0 a copy per read port, 1 banked (otpu_slice)
+  parameter int TMEM_IMPL  = 0,       // TMEM: 0 a copy per read port, 1 banked (otpu_slice)
+  parameter bit TMEM_RQ    = 1'b0,    // TMEM_IMPL 1: request-priority bank addresses (otpu_slice)
+  parameter int TMEM_NCP   = 3,       // TMEM_IMPL 1: copies (otpu_slice)
+  parameter int TMEM_NSB   = 8,       // TMEM_IMPL 3: sub-banks per bank (otpu_slice)
+  parameter int TMEM_SBP   = 3,       // TMEM_IMPL 3: the sub-bank field's word-address bit
+  parameter int TMEM_SBH   = 0,       // TMEM_IMPL 3: the sub-bank hashed (otpu_slice)
+  parameter bit TMEM_RPL   = 1'b0,    // TMEM_IMPL 3: lost reads replayed (otpu_slice)
+  parameter bit TMEM_TDP   = 1'b0,    // TMEM_IMPL 3: true dual-port RAMs (otpu_slice)
+  parameter bit TMEM_GST   = 1'b0,    // TMEM_IMPL 3: QUANT 3 and COLL the DMA's guests (otpu_slice)
+  parameter int TMEM_PMP   = 0,       // TMEM_TDP: 2 the pumped RAMs' model (otpu_slice)
+  parameter int TMEM_PRK   = 0,       // TMEM_IMPL 3: the read ports' ranks (otpu_slice)
+  parameter int TMEM_SDM   = -1,      // TMEM_TDP: the read ports' RAM sides (otpu_slice)
+  parameter bit SEQ_WC     = 1'b0,    // EXPERIMENTAL: otpu_seq's wait counts (otpu_slice)
+  parameter bit COLL_GATHER = 1'b1    // 0 (S = 1 only): the collective unit runs BAR alone
+                                      // (otpu_coll_bar), as the card builds it (otpu_board)
 ) (
   input  logic          clk,
+  input  logic          clk_f,         // TMEM_PMP 1: 2 x clk, rising with it (otpu_slice)
   input  logic          sys_rst,
   input  logic          rst,
   input  logic [31:0]   rinit [8],     // the run's arguments (R8..R15 at the start)
@@ -56,7 +73,8 @@ module otpu_top
     logic          a_req, a_we, a_rvalid, b_req, b_tag, b_we, b_par, b_rvalid, b_rtag;
     logic [D/4-1:0] b_wmask;
     logic [D*8-1:0] b_wdata;
-    logic [31:0]   a_addr, a_wdata, a_rdata, a_rdata2, b_addr;
+    logic [31:0]   a_addr, a_wdata, b_addr;
+    logic [255:0]  a_rdata;
     logic [3:0]    a_be;
     logic [D*8-1:0] b_rdata;
     logic          a_rdy, b_rdy, wr_idle, rd_idle, sw_req, sw_rdy, a_inval;
@@ -69,7 +87,7 @@ module otpu_top
       assign b_rdy = 1'b1;
       assign wr_idle = 1'b1;
       otpu_dram #(.WORDS(DRAM_WORDS), .D(D), .LAT(DRAM_LAT), .SID(s)) u_dram (
-        .clk, .a_req, .a_we, .a_addr, .a_wdata, .a_be, .a_rvalid, .a_rdata, .a_rdata2,
+        .clk, .a_req, .a_we, .a_addr, .a_wdata, .a_be, .a_rvalid, .a_rdata,
         .sw_req, .sw_addr, .sw_wdata, .sw_be,
         .b_req, .b_tag, .b_we, .b_wmask, .b_wdata, .b_addr, .b_rvalid, .b_rtag, .b_rdata, .rd_idle,
         .dump);
@@ -82,7 +100,7 @@ module otpu_top
       otpu_native_dram #(.D(D)) u_adapt (
         .clk, .rst(sys_rst), .a_flush(rst || ld_start || a_inval),   // as otpu_board
         .a_rdy_x(a_rdy), .a_req_x(a_req), .a_we_x(a_we), .a_addr_x(a_addr), .a_wdata_x(a_wdata),
-        .a_be_x(a_be), .a_rvalid, .a_rdata, .a_rdata2,
+        .a_be_x(a_be), .a_rvalid, .a_rdata,
         .sw_rdy, .sw_req, .sw_addr, .sw_wdata, .sw_be,
         .b_rdy, .b_req, .b_tag, .b_we, .b_wmask, .b_wdata, .b_addr, .b_par, .b_rvalid, .b_rtag,
         .b_rdata, .wr_idle, .rd_idle,
@@ -116,12 +134,15 @@ module otpu_top
     otpu_slice #(.SID(s), .S(S), .D(D), .MCOLS(MCOLS), .ACT_BLOCKS(ACT_BLOCKS), .ACT_ROWS(ACT_ROWS),
                  .TMEM_WORDS(TMEM_WORDS), .IMEM_WORDS(IMEM_WORDS),
                  .FIFO_DEPTH(FIFO_DEPTH), .LANES(LANES), .WIN(WIN), .RPB(RPB),
-                 .WPB(WPB), .MXU_IMPL(MXU_IMPL), .MXU_CL(MXU_CL), .VPU_CL(VPU_CL), .ULANES(ULANES),
-                 .TMEM_IMPL(TMEM_IMPL))
+                 .WPB(WPB), .MXU_IMPL(MXU_IMPL), .MXU_CL(MXU_CL), .MXU_E(MXU_E), .QUANT_XD(QUANT_XD), .VPU_CL(VPU_CL), .ULANES(ULANES),
+                 .TMEM_IMPL(TMEM_IMPL), .TMEM_RQ(TMEM_RQ), .TMEM_NCP(TMEM_NCP),
+                 .TMEM_NSB(TMEM_NSB), .TMEM_SBP(TMEM_SBP), .TMEM_SBH(TMEM_SBH),
+                 .TMEM_RPL(TMEM_RPL), .TMEM_TDP(TMEM_TDP), .TMEM_GST(TMEM_GST),
+                 .TMEM_PMP(TMEM_PMP), .TMEM_PRK(TMEM_PRK), .TMEM_SDM(TMEM_SDM), .SEQ_WC(SEQ_WC))
     u_slice (
-      .clk, .sys_rst, .rst, .rinit, .ld_start, .ld_addr, .ld_n, .ld_busy(ldb[s]),
+      .clk, .clk_f, .sys_rst, .rst, .rinit, .ld_start, .ld_addr, .ld_n, .ld_busy(ldb[s]),
       .a_rdy, .b_rdy, .sw_rdy, .wr_idle, .rd_idle,
-      .a_req, .a_we, .a_addr, .a_wdata, .a_be, .a_rvalid, .a_rdata, .a_rdata2,
+      .a_req, .a_we, .a_addr, .a_wdata, .a_be, .a_rvalid, .a_rdata,
       .sw_req, .sw_addr, .sw_wdata, .sw_be,
       .b_req, .b_tag, .b_we, .b_wmask, .b_wdata, .b_addr, .b_par, .b_rvalid, .b_rtag, .b_rdata,
       .coll_req(coll_req[s]), .coll_cmd(coll_cmd[s]), .coll_ack,
@@ -130,11 +151,21 @@ module otpu_top
       .halted(halted[s]), .error(error[s]), .wait_to(), .a_inval, .icount(icount[s]), .pf(), .dump);
   end
 
-  otpu_coll #(.S(S), .LANES(LANES)) u_coll (
-    .clk, .rst, .req(coll_req), .cmds(coll_cmd), .gnt(coll_gnt), .ack(coll_ack),
-    .r_en(coll_ren), .r_addr(coll_raddr), .r_data(coll_rdata),
-    .w_en(coll_wen), .w_addr(coll_waddr), .w_data(coll_wdata));
+  logic coll_gerr;                    // a GATHER on the BAR-only collective unit
+  initial if (S > 1 && !COLL_GATHER) $fatal(1, "otpu_top: COLL_GATHER 0 needs S = 1");
+  if (COLL_GATHER) begin : g_coll
+    otpu_coll #(.S(S), .LANES(LANES)) u_coll (
+      .clk, .rst, .req(coll_req), .cmds(coll_cmd), .gnt(coll_gnt), .ack(coll_ack),
+      .r_en(coll_ren), .r_addr(coll_raddr), .r_data(coll_rdata),
+      .w_en(coll_wen), .w_addr(coll_waddr), .w_data(coll_wdata));
+    assign coll_gerr = 1'b0;
+  end else begin : g_coll_bar
+    otpu_coll_bar #(.S(S), .LANES(LANES)) u_coll (
+      .clk, .rst, .req(coll_req), .cmds(coll_cmd), .gnt(coll_gnt), .ack(coll_ack),
+      .r_en(coll_ren), .r_addr(coll_raddr), .r_data(coll_rdata),
+      .w_en(coll_wen), .w_addr(coll_waddr), .w_data(coll_wdata), .gerr(coll_gerr));
+  end
 
   assign all_halted = &halted;
-  assign any_error  = |error;
+  assign any_error  = |error || coll_gerr;
 endmodule

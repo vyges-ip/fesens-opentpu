@@ -1,5 +1,5 @@
 // Host control registers (AXI4-Lite slave, reached from the host through the PCIe bridge's
-// BAR). All in the core clock domain. Register map version 4 (docs/observability.md: the
+// BAR). All in the core clock domain. Register map version 5 (docs/observability.md: the
 // contract with the host); 12 address bits are decoded (the map repeats every 4 KiB).
 //
 //   0x00 ID        RO  0x4F545055 ("OTPU")
@@ -35,7 +35,7 @@
 //   0x30 SW_WR     RO  scalar (QST) write requests taken
 //   0x34 B_STALL   RO  cycles a port B request waited for the memory
 //   0x38 SCRATCH   RW  (host bring-up test)
-//   0x3C REGMAP    RO  register map version (4; 3 before the CFG_* registers)
+//   0x3C REGMAP    RO  register map version (5; 4 before CAPS2, 3 before the CFG_* registers)
 //   0x40 CAPS      RO  bit0 trace buffer, bit1 temperature, bit2 I2C pins, bit3 DDR_MTS,
 //                      bit4 4-bit MM weights (MM flags WF, docs/isa.md), bit5 column reuse (MM
 //                      PAIR / QACT DUP), bit6 DSTEP (the DMA's DeltaNet head step), bit7
@@ -44,7 +44,10 @@
 //                      bit25 the run's arguments (ARG0..7), bit26 STREAM (the stream engine's
 //                      hardware subset, docs/stream.md; with DSTEP), bit27 the DDR3
 //                      controllers want the host's calibration (LiteDRAM:
-//                      opentpu/host/memcal.py), bit30 GEN: the decode loop's instructions
+//                      opentpu/host/memcal.py), bit29 MX: the MX numerics (MM's exact
+//                      accumulation with power-of-two block scales, QACT / QST's offsets;
+//                      docs/isa.md, docs/mx_mxu.md; every bitstream since), bit30 GEN: the
+//                      decode loop's instructions
 //                      (RLD, VOP ARGMAX, HALT CHAIN; docs/isa.md, docs/autodecode.md), bit31
 //                      WAITW (the DMA waits for a word the host writes; docs/isa.md)
 //   0x44 CORE_KHZ  RO  the core clock in kHz (build parameter)
@@ -53,6 +56,9 @@
 //   0x50 SNAP      W   latch every free-running counter into its shadow; R: snapshots taken
 //   0x54 DDR_MTS   RO  the DDR3 data rate in MT/s (build parameter; CAPS bit3 when nonzero)
 //   0x58 ACT_ROWS  RO  ACT RAM rows: the most rows of one MM (build parameter; CAPS bit24)
+//   0x5C CAPS2     RO  (version 5; CAPS is full) bit0 GATHER: the collective unit runs GATHER
+//                      (always at S > 1; at S = 1 unless built without it, otpu_board COLL_GATHER:
+//                      then BAR alone, and a GATHER raises ERROR)
 //   0x60 + 4k      RW  ARG0..ARG7: the run's arguments, R8..R15 when RUN rises (CAPS bit25;
 //                      docs/isa.md "Arguments"); reset 0
 //   0x80 CFG_SLICES   RO  slices S (version 4: the configuration the target file built,
@@ -62,7 +68,8 @@
 //   0x8C CFG_ACT      RO  ACT RAM blocks
 //   0x90 CFG_DRAM     RO  [7:0] log2 DRAM bytes per slice, [15:8] memory channels per slice,
 //                         [23:16] log2 bytes a slice addresses per channel
-//   0x94 CFG_UARCH    RO  [3:0] MXU_IMPL, [7:4] TMEM_IMPL, [15:8] VPU_CL, [23:16] ULANES
+//   0x94 CFG_UARCH    RO  [3:0] MXU_IMPL, [7:4] TMEM_IMPL, [15:8] VPU_CL, [23:16] ULANES,
+//                         [24] SEQ_WC (otpu_seq's wait entries: every program needs them, docs/isa.md)
 //   0x98 CFG_PLATFORM RO  the target's platform id (1 YPCB-00338, 2 BCU1525; 256 and up ASICs)
 //   0x9C CFG_HASH     RO  opentpu.target.arch_hash of the target's Config at build time
 //   0xA0 + 4s         (reserved: slice s's DRAM window, docs/targets.md)
@@ -99,6 +106,7 @@ module otpu_ctrl #(
   parameter bit CHASH = 1'b0,            // CAPS bit7: the hashed channel interleave (otpu_native_dram)
   parameter bit DSTEP = 1'b1,            // CAPS bit6 and bit26: the stream engine (DSTEP, STREAM)
   parameter bit HOSTCAL = 1'b0,          // CAPS bit27: the host calibrates the DDR3 controllers
+  parameter bit COLL_GATHER = 1'b1,      // CAPS2 bit0 (with S > 1): the collective unit runs GATHER
   parameter int LDP = 2,                 // cycles after LOAD before the loaders' busy shows (>= 2)
   // the configuration registers (CFG_*, register map 4): the target's values
   parameter int S          = 1,
@@ -112,6 +120,7 @@ module otpu_ctrl #(
   parameter int TMEM_IMPL  = 0,
   parameter int VPU_CL     = 2,
   parameter int ULANES     = 8,
+  parameter bit SEQ_WC     = 1'b0,    // EXPERIMENTAL: otpu_seq's wait entries (WAITC, docs/seq_vpu.md; CFG_UARCH bit24)
   parameter int PLATFORM   = 0,
   parameter logic [31:0] ARCH_HASH = 32'h0,
   // the free-running counters' increment widths (2 and 2 for the YPCB's one slice on two
@@ -178,11 +187,13 @@ module otpu_ctrl #(
   input  logic [4:0]  i2c_in
 );
   localparam int NFR = 13;
-  localparam logic [31:0] CAPS = {1'b1, 1'b1, 2'd0, HOSTCAL, DSTEP, 2'd3,  // bit31 WAITW, bit30 GEN, bit27 HOSTCAL, bit26 STREAM, bit25 ARG, bit24 ACT_ROWS
+  localparam logic [31:0] CAPS = {1'b1, 1'b1, 1'b1, 1'b0, HOSTCAL, DSTEP, 2'd3,  // bit31 WAITW, bit30 GEN, bit29 MX, bit27 HOSTCAL, bit26 STREAM, bit25 ARG, bit24 ACT_ROWS
                                   8'($clog2(PQ_WIN)),
                                   8'(TRACE_DEPTH != 0 ? $clog2(TRACE_DEPTH) : 0),
                                   CHASH, DSTEP, 1'b1, 1'b1, DDR_MTS != 0, HAS_I2C, HAS_TEMP,
                                   TRACE_DEPTH != 0};
+
+  localparam logic [31:0] CAPS2 = {31'd0, COLL_GATHER || S > 1};   // bit0 GATHER
 
   logic [63:0] cycles;
   logic [31:0] n_brd, n_bwr, n_ard, n_awr, n_bst, scratch;
@@ -328,7 +339,7 @@ module otpu_ctrl #(
       10'h00C: r_d <= n_awr;
       10'h00D: r_d <= n_bst;
       10'h00E: r_d <= scratch;
-      10'h00F: r_d <= 32'd4;
+      10'h00F: r_d <= 32'd5;
       10'h010: r_d <= CAPS;
       10'h011: r_d <= 32'(CORE_KHZ);
       10'h012: r_d <= BUILD_ID;
@@ -336,6 +347,7 @@ module otpu_ctrl #(
       10'h014: r_d <= n_snap;
       10'h015: r_d <= 32'(DDR_MTS);
       10'h016: r_d <= 32'(ACT_ROWS);
+      10'h017: r_d <= CAPS2;
       10'h018, 10'h019, 10'h01A, 10'h01B, 10'h01C, 10'h01D, 10'h01E, 10'h01F:
         r_d <= arg[r_a[2:0]];
       10'h020: r_d <= 32'(S);
@@ -343,7 +355,7 @@ module otpu_ctrl #(
       10'h022: r_d <= 32'(IMEM_WORDS);
       10'h023: r_d <= 32'(ACT_BLOCKS);
       10'h024: r_d <= {8'd0, 8'(CH_LOG2), 8'(NCH), 8'(DRAM_LOG2)};
-      10'h025: r_d <= {8'd0, 8'(ULANES), 8'(VPU_CL), 4'(TMEM_IMPL), 4'(MXU_IMPL)};
+      10'h025: r_d <= {7'd0, SEQ_WC, 8'(ULANES), 8'(VPU_CL), 4'(TMEM_IMPL), 4'(MXU_IMPL)};
       10'h026: r_d <= 32'(PLATFORM);
       10'h027: r_d <= ARCH_HASH;
       10'h080: r_d <= {28'd0, tr_busy, tr_stop, 1'b0, tr_en};

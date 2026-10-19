@@ -6,7 +6,8 @@
 // All reads are synchronous and registered with an enable: rd holds while re (en) is low. A read
 // of the word written at the same edge returns the old word here (read-first); the macros do not
 // promise it (a 1R1W macro's same-address read is undefined), so a user must not depend on it
-// (otpu_tmem bypasses the write it would hit). STYLE is the FPGA's ram_style ("block",
+// (otpu_tmem bypasses the write it would hit); otpu_ram_1rw1r is read-first on both families
+// (below). STYLE is the FPGA's ram_style ("block",
 // "distributed" or "auto"); the macros ignore it. In simulation every word starts at 0, unless
 // ZERO is 0 (a user that loads the memory from its own initial block: their order is undefined).
 
@@ -123,6 +124,54 @@ module otpu_ram_1rw #(
       if (we) mem[a] <= wd;
       else rd <= mem[a];
     end
+`ifndef SYNTHESIS
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
+`endif
+  end
+endmodule
+
+// Two ports (true dual-port, one writing): port A a read or a write per cycle (ena: the access,
+// wea: a write), port B a read (enb). Both read first: port A's write cycle loads rda with the
+// word before the write, and port B's read of the word port A writes at that edge returns the
+// word before it (the FPGA's true dual-port block RAM in READ_FIRST; the ASIC's 1RW1R macros as
+// tools/asic/fakeram.py models them). otpu_tmem IMPL 3 TDP's replays depend on it.
+module otpu_ram_1rw1r #(
+  parameter int    W     = 32,
+  parameter int    N     = 1024,
+  parameter string STYLE = "block",
+  parameter bit    ZERO  = 1'b1
+) (
+  input  logic                 clk,
+  input  logic                 ena,
+  input  logic                 wea,
+  input  logic [$clog2(N)-1:0] aa,
+  input  logic [W-1:0]         wda,
+  output logic [W-1:0]         rda,
+  input  logic                 enb,
+  input  logic [$clog2(N)-1:0] ab,
+  output logic [W-1:0]         rdb
+);
+  if (STYLE == "block") begin : g_bram
+    (* ram_style = "block" *) logic [W-1:0] mem [N];
+    always_ff @(posedge clk)
+      if (ena) begin
+        if (wea) mem[aa] <= wda;
+        rda <= mem[aa];
+      end
+    always_ff @(posedge clk)
+      if (enb) rdb <= mem[ab];
+`ifndef SYNTHESIS
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
+`endif
+  end else begin : g_auto
+    logic [W-1:0] mem [N];
+    always_ff @(posedge clk)
+      if (ena) begin
+        if (wea) mem[aa] <= wda;
+        rda <= mem[aa];
+      end
+    always_ff @(posedge clk)
+      if (enb) rdb <= mem[ab];
 `ifndef SYNTHESIS
     initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
 `endif

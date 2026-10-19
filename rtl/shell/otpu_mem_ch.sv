@@ -6,10 +6,11 @@
 // Each master's commands cross into uclk through its own asynchronous FIFOs (commands, write
 // data) and its read data comes back through another; an arbiter in uclk takes up to RUN commands
 // from one master before it lets the other in, one command per cycle, and each master's commands
-// in its order. The accelerator's write data comes in write-command order, before or after its
-// command: a write goes when both are at the heads of their FIFOs. The controller returns a port's
-// read data in that port's command order and cannot hold it back, so one tag per read (its master,
-// its slot) routes the data back, and a master's read is issued only when its read-data FIFO has
+// in its order (XDMA's writes held back into batches while the accelerator streams: XT, XB, below).
+// The accelerator's write data comes in write-command order, before or after its command: a write
+// goes when both are at the heads of their FIFOs. The controller returns a port's read data in
+// that port's command order and cannot hold it back, so one tag per read (its master, its slot)
+// routes the data back, and a master's read is issued only when its read-data FIFO has
 // room for it and for every read not yet through (credits). The accelerator's read data leaves
 // without backpressure too (its master reserves room for its reads), from a register.
 //
@@ -88,7 +89,10 @@ module otpu_mem_ch #(
   parameter int XRD  = 16,        // XDMA read-data FIFO, beats
   parameter int RUN  = 32,        // commands from one master before the arbiter may switch
   parameter int OQ   = 32,        // output command queue per port (and one register)
-  parameter int OD   = 32         // output write-data FIFO per port: writes issued, data not taken
+  parameter int OD   = 32,        // output write-data FIFO per port: writes issued, data not taken
+  parameter int XQD  = 32,        // XDMA's command and write-data FIFOs, beats (a batch's room)
+  parameter int XT   = 256,       // XDMA's batches: uclk cycles a ready X waits for one (0: none)
+  parameter int XB   = 24         // ... or until XB of its commands are queued (0: the wait alone)
 ) (
   // accelerator (otpu_native_dram), core clock
   input  logic            clk,
@@ -156,7 +160,9 @@ module otpu_mem_ch #(
   localparam int ASW = $clog2(ARD);        // read slots
   localparam int XSW = $clog2(XRD);
   localparam int TW  = 2 + ASW;            // read tag: {read-modify-write, xdma, slot}
-  initial if (ARD + XRD + 1 > 128) $fatal(1, "otpu_mem_ch: ARD + XRD reads in flight exceed the tag FIFO");
+  // the read tags' FIFO per port: every read in flight (ARD + XRD and a read-modify-write's), a
+  // power of two (128 at the board's ARD 64, XRD 16)
+  localparam int TGD = 2 ** $clog2(ARD + XRD + 1);
   initial if (XRD > ARD) $fatal(1, "otpu_mem_ch: XRD > ARD (the tag's slot)");
 
   function automatic logic [CW-1:0] b2g(input logic [CW-1:0] b);
@@ -226,31 +232,31 @@ module otpu_mem_ch #(
   logic [AOW-1:0] ar_used;
   logic [XOW-1:0] xr_used;
   logic [5:0] unused_aq, unused_ad;
-  logic [4:0] unused_xq, unused_xd;
+  logic [$clog2(XQD):0] unused_xq, unused_xd, xq_used;
   logic [$clog2(ARD)-1:0] ar_slot;         // the read-data FIFOs' slots (out-of-order writes)
   logic [$clog2(XRD)-1:0] xr_slot;
   logic ar_cmt, xr_cmt;
 
   otpu_afifo #(.W(QW), .DEPTH(32)) u_aq (.wclk(clk), .wrst(a_hs2), .wvalid(aq_wv), .wready(aq_wr),
     .wdata(aq_wd), .wslot('0), .wcommit(), .wused(unused_aq), .rclk(uclk), .rrst(a_hold),
-    .rvalid(aq_rv), .rready(aq_rr), .rdata(aq_rd));
+    .rvalid(aq_rv), .rready(aq_rr), .rdata(aq_rd), .rused());
   otpu_afifo #(.W(DW), .DEPTH(32)) u_ad (.wclk(clk), .wrst(a_hs2), .wvalid(ad_wv), .wready(ad_wr),
     .wdata(ad_wd), .wslot('0), .wcommit(), .wused(unused_ad), .rclk(uclk), .rrst(a_hold),
-    .rvalid(ad_rv), .rready(ad_rr), .rdata(ad_rd));
+    .rvalid(ad_rv), .rready(ad_rr), .rdata(ad_rd), .rused());
   // the read data, written out of order at each read's slot (the two ports return independently)
   otpu_afifo #(.W(512), .DEPTH(ARD), .OOO(1'b1)) u_ar (.wclk(uclk), .wrst(a_hold), .wvalid(ar_wv),
     .wready(ar_wr), .wdata(ar_wd), .wslot(ar_slot), .wcommit(ar_cmt), .wused(ar_used), .rclk(clk),
-    .rrst(a_hs2), .rvalid(ar_rv), .rready(ar_rr), .rdata(ar_rd));
+    .rrst(a_hs2), .rvalid(ar_rv), .rready(ar_rr), .rdata(ar_rd), .rused());
   // the XDMA side's write enables start from flip-flops (RWR: a registered wready)
-  otpu_afifo #(.W(QW), .DEPTH(16), .RWR(1'b1)) u_xq (.wclk(xclk), .wrst(x_hs2), .wvalid(xq_wv),
+  otpu_afifo #(.W(QW), .DEPTH(XQD), .RWR(1'b1)) u_xq (.wclk(xclk), .wrst(x_hs2), .wvalid(xq_wv),
     .wready(xq_wr), .wdata(xq_wd), .wslot('0), .wcommit(), .wused(unused_xq), .rclk(uclk),
-    .rrst(x_hold), .rvalid(xq_rv), .rready(xq_rr), .rdata(xq_rd));
-  otpu_afifo #(.W(DW), .DEPTH(16), .RWR(1'b1)) u_xd (.wclk(xclk), .wrst(x_hs2), .wvalid(xd_wv),
+    .rrst(x_hold), .rvalid(xq_rv), .rready(xq_rr), .rdata(xq_rd), .rused(xq_used));
+  otpu_afifo #(.W(DW), .DEPTH(XQD), .RWR(1'b1)) u_xd (.wclk(xclk), .wrst(x_hs2), .wvalid(xd_wv),
     .wready(xd_wr), .wdata(xd_wd), .wslot('0), .wcommit(), .wused(unused_xd), .rclk(uclk),
-    .rrst(x_hold), .rvalid(xd_rv), .rready(xd_rr), .rdata(xd_rd));
+    .rrst(x_hold), .rvalid(xd_rv), .rready(xd_rr), .rdata(xd_rd), .rused());
   otpu_afifo #(.W(512), .DEPTH(XRD), .OOO(1'b1)) u_xr (.wclk(uclk), .wrst(x_hold), .wvalid(xr_wv),
     .wready(xr_wr), .wdata(xr_wd), .wslot(xr_slot), .wcommit(xr_cmt), .wused(xr_used), .rclk(xclk),
-    .rrst(x_hs2), .rvalid(xr_rv), .rready(xr_rr), .rdata(xr_rd));
+    .rrst(x_hs2), .rvalid(xr_rv), .rready(xr_rr), .rdata(xr_rd), .rused());
 
   // write beats taken by the controller, per master: the ports' counts (gray counters from uclk,
   // g_port) as synchronized and decoded in the master's clock, summed
@@ -447,8 +453,34 @@ module otpu_mem_ch #(
   logic          rm_ret, rm_ok;
   assign a_ok = aq_rv && (aq_rd[QW-1] ? ad_rv : a_rok);
   assign x_ok = xq_rv && (xq_rd[QW-1] ? xd_rv : x_rok);
+  // XDMA's batches (XT > 0). Once the accelerator has had its RUN, a ready X goes only when it has
+  // waited XT cycles since its last command or has XB commands queued (x_ripe), so its FIFOs (XQD)
+  // fill and its turn carries a batch: the controller turns its bus from the accelerator's reads
+  // and changes rows once a batch instead of every burst. Host writes streaming during a run then
+  // cost the accelerator a quarter to a half less (co-simulated layer runs: 0.20 -> 0.10 s a GB
+  // written at 1 GB/s, 0.13 -> 0.08 at 2, 0.10 -> 0.075 at 3; docs/offload.md 13.19). XB lets a
+  // fast stream go once its batch is in, so the batches never hold XDMA under the link's rate (the
+  // wait alone gives it at most RUN commands per XT + RUN cycles: 2.8 of 3 GB/s beside a layer
+  // run); 24 leaves room for what arrives at that rate while the accelerator ends its RUN. A ready
+  // X still goes at once when the accelerator has nothing to issue (the card waiting on a miss),
+  // and with XDMA idle the arbiter is the one without batches (XT 0).
+  logic x_ripe;
+  if (XT > 0) begin : g_xt
+    localparam int XAW = $clog2(XT + 1);
+    logic [XAW-1:0] x_age;               // cycles X has been ready since its last command
+    always_ff @(posedge uclk)
+      if (urq || (go && pick_x) || !x_ok) begin
+        x_age  <= '0;
+        x_ripe <= 1'b0;
+      end else begin
+        if (x_age != XAW'(XT)) x_age <= x_age + 1'b1;
+        x_ripe <= x_age >= XAW'(XT - 1) || (XB > 0 && xq_used >= ($clog2(XQD) + 1)'(XB));
+      end
+  end else begin : g_nxt
+    assign x_ripe = 1'b1;
+  end
   always_comb begin
-    if (!cur_x) pick_x = x_ok && (!a_ok || run >= 6'(RUN));
+    if (!cur_x) pick_x = x_ok && (!a_ok || (run >= 6'(RUN) && x_ripe));
     else        pick_x = !a_ok || (x_ok && run < 6'(RUN));
   end
   assign sel_x = rm_busy ? rm_x : pick_x;  // a read-modify-write: its master's heads
@@ -572,7 +604,7 @@ module otpu_mem_ch #(
       .rdata(c_wdata_data[p]));
     assign c_wdata_we[p] = '1;
 
-    otpu_sfifo #(.W(TW), .DEPTH(128)) u_tag (.clk(uclk), .rst(urq),
+    otpu_sfifo #(.W(TW), .DEPTH(TGD)) u_tag (.clk(uclk), .rst(urq),
       .wvalid(go && (!we || rmw) && tp == 1'(p)), .wready(tg_wr[p]),
       .wdata({rmw, pick_x, pick_x ? ASW'(x_seq) : a_seq}), .rvalid(tg_rv[p]),
       .rready(c_rdata_valid[p]), .rdata(tg_rd[p]));

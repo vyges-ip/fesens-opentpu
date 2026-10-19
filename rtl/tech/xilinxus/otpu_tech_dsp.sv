@@ -10,7 +10,7 @@
 // (BREG 1), the two weight streams on A (low) and D (high), one selected by the pre-adder's input
 // gates (INMODE: sel 0 -> A, 1 -> D), the product in M and the chain's running sum in P:
 // P = PCIN + M (FIRST: P = M). A chain's LAST position leaves P unregistered: the column end's A
-// / D input registers take its place (otpu_colend), so the route to the column end is not in
+// / D input registers take its place (otpu_mxce), so the route to the column end is not in
 // front of its pre-adder and multiplier. The select is registered in the DSP (INMODEREG, loaded
 // with en): sel is its next value, so the fabric's route to the DSP column ends at the INMODE
 // register instead of before the pre-adder and multiplier (133.33 MHz, 812bb01: hi0 -> INMODE,
@@ -56,53 +56,78 @@ module otpu_pe #(parameter bit FIRST = 1'b0, parameter bit LAST = 1'b0, paramete
 endmodule
 
 
-// The systolic MXU's column end (IMPL 2): four DSP48E2s, one per sub-block b. DSP b registers the
-// sub-block's chain ends (a[b], d[b]: the chains' last P, which otpu_pe LAST leaves unregistered)
-// in its A and D registers, sums them in its pre-adder, multiplies by m_b (its B register:
-// mb[4b+3:4b], unsigned, loaded with a / d) into M (v[b]); the block sum runs down the cascade in
-// the same cycle, P = PCIN + M (DSP 0: P = M), and DSP 3 registers it (PREG):
-//   s = v0 + v1 + v2 + v3   (one cycle after v, as a fabric or inferred sum would)
-// The cascade keeps the sum off the fabric: Vivado mapped the inferred sum into three DSP ALUs
-// joined through the C port (two fabric routes, 6.76 ns: -0.479 ns at 133.33 MHz). The input
-// registers keep the route from the chain ends (3.5 ns in the OOC) out of the multiplier's cycle:
-// the chain ends' P -> v was 0.008 ns from failing out of context at 133.33 MHz. Exact: every
-// value fits 48 bits, s is the sum's low SW bits. rtl/tech/generic holds the
-// equivalent behavioural model.
-module otpu_colend #(parameter int SW = 23) (
-  input  logic                 clk,
-  input  logic                 en,
-  input  logic [3:0][23:0]     a,        // sub-block b's chain ends: the pre-adder's A ...
-  input  logic [3:0][23:0]     d,        // ... and D (signed)
-  input  logic [15:0]          mb,       // m_3 .. m_0, with a / d
-  output logic signed [SW-1:0] s
+// The MX column end (otpu_mxu, docs/mx_mxu.md): nine DSP48E2s, as rtl/tech/xilinx7's DSP48E1s. DSP g (g < 8) takes group g's
+// chain end on A (and, at two chains a group, the second on D: the pre-adder sums them) and its
+// B = m << sh on B (unsigned, < 2^17), all registered at E, and multiplies into M. Groups 0..3:
+// M at E+1, their sum down a cascade in the same cycle (P = PCIN + M, DSP 0: P = M), registered
+// by DSP 3 at E+2 (p3: the production column end's four cascaded post-adders, which close at
+// 133.33 MHz). Groups 4..7 a cycle later (B's second register, BREG 2, and the pre-adder's,
+// ADREG, or at one chain a group A's second, AREG 2): M at E+2, P = PCIN + M from p3 on,
+// registered by DSP 7 at E+3 (p7). DSP 8 accumulates
+// the row: P = (first ? 0 : P) + PCIN at E+4, first in its OPMODE register (loaded at E+3: X is P
+// or 0). Every sum stays on the cascades. Exact: |a + d| < 2^24 in the 27-bit pre-adder, B in
+// 18 bits signed, a row's sum < 2^47. rtl/tech/generic holds the equivalent behavioural model.
+module otpu_mxce #(parameter int CPG = 1) (
+  input  logic                clk,
+  input  logic [7:0][23:0]    a,        // group g's chain end: the pre-adder's A ...
+  input  logic [7:0][23:0]    d,        // ... and D (CPG 2: the group's second chain; else unused)
+  input  logic [7:0][16:0]    bm,       // B = m << sh, with a / d
+  input  logic                first,    // the row's first block (two cycles after a / d / bm)
+  output logic [47:0]         acc
 );
-  // the DSP48E1's pre-adder width (25 bits; the DSP48E2's is 27): every technology takes
-  // the same parameters
-  initial if (SW > 25) $fatal(1, "otpu_colend: SW %0d > 25", SW);
-  logic [3:0][47:0] pc, pf;
-  for (genvar b = 0; b < 4; b++) begin : g_d
+  initial if (CPG != 1 && CPG != 2) $fatal(1, "otpu_mxce: CPG %0d", CPG);
+  logic [8:0][47:0] pc, pf;
+  for (genvar g = 0; g < 8; g++) begin : g_m
+    // groups 4..7: a register more before the multiplier (the pre-adder's, or A's second)
+    localparam bit LATE = (g >= 4);
+    localparam int AR = (LATE && CPG == 1) ? 2 : 1;
     DSP48E2 #(
-      .A_INPUT("DIRECT"), .B_INPUT("DIRECT"), .AMULTSEL("AD"), .BMULTSEL("B"),
-      .PREADDINSEL("A"), .USE_MULT("MULTIPLY"), .USE_WIDEXOR("FALSE"),
-      .USE_SIMD("ONE48"), .AREG(1), .ACASCREG(1), .BREG(1), .BCASCREG(1), .CREG(0), .DREG(1),
-      .ADREG(0), .MREG(1), .PREG(b == 3 ? 1 : 0), .INMODEREG(0), .OPMODEREG(0), .ALUMODEREG(0),
+      .A_INPUT("DIRECT"), .B_INPUT("DIRECT"), .AMULTSEL(CPG == 2 ? "AD" : "A"), .BMULTSEL("B"),
+      .PREADDINSEL("A"), .USE_MULT("MULTIPLY"), .USE_WIDEXOR("FALSE"), .USE_SIMD("ONE48"), .AREG(AR), .ACASCREG(AR), .BREG(LATE ? 2 : 1),
+      .BCASCREG(LATE ? 2 : 1), .CREG(0), .DREG(CPG == 2 ? 1 : 0),
+      .ADREG((LATE && CPG == 2) ? 1 : 0), .MREG(1),
+      .PREG((g == 3 || g == 7) ? 1 : 0), .INMODEREG(0), .OPMODEREG(0), .ALUMODEREG(0),
       .CARRYINREG(0), .CARRYINSELREG(0), .USE_PATTERN_DETECT("NO_PATDET"),
       .AUTORESET_PATDET("NO_RESET"), .MASK(48'h3fffffffffff), .PATTERN(48'h0),
       .SEL_MASK("MASK"), .SEL_PATTERN("PATTERN")
     ) u_dsp (
       .CLK(clk),
-      .A({{6{a[b][23]}}, a[b]}), .B({14'd0, mb[4*b +: 4]}), .C(48'd0), .D({{3{d[b][23]}}, d[b]}),
-      .INMODE(5'b00100), .OPMODE(b == 0 ? 9'b00_000_01_01 : 9'b00_001_01_01),
+      .A({{6{a[g][23]}}, a[g]}), .B({1'b0, bm[g]}), .C(48'd0),
+      .D((CPG == 2) ? {{3{d[g][23]}}, d[g]} : 27'd0),
+      .INMODE((CPG == 2) ? 5'b00100 : 5'b00000), .OPMODE(g == 0 ? 9'b00_000_01_01 : 9'b00_001_01_01),
       .ALUMODE(4'b0000), .CARRYIN(1'b0), .CARRYINSEL(3'b000),
-      .CEA1(en), .CEA2(en), .CEB1(en), .CEB2(en), .CEC(1'b0), .CED(en), .CEAD(1'b0),
-      .CEM(en), .CEP(b == 3 ? en : 1'b0), .CEALUMODE(1'b0), .CECTRL(1'b0), .CECARRYIN(1'b0),
-      .CEINMODE(1'b0),
+      .CEA1(AR == 2 ? 1'b1 : 1'b0), .CEA2(1'b1), .CEB1(LATE ? 1'b1 : 1'b0), .CEB2(1'b1),
+      .CEC(1'b0), .CED(CPG == 2 ? 1'b1 : 1'b0), .CEAD((LATE && CPG == 2) ? 1'b1 : 1'b0),
+      .CEM(1'b1), .CEP((g == 3 || g == 7) ? 1'b1 : 1'b0), .CEALUMODE(1'b0), .CECTRL(1'b0),
+      .CECARRYIN(1'b0), .CEINMODE(1'b0),
       .RSTA(1'b0), .RSTB(1'b0), .RSTC(1'b0), .RSTD(1'b0), .RSTM(1'b0), .RSTP(1'b0),
       .RSTALLCARRYIN(1'b0), .RSTALUMODE(1'b0), .RSTCTRL(1'b0), .RSTINMODE(1'b0),
-      .ACIN(30'd0), .BCIN(18'd0), .PCIN(b == 0 ? 48'd0 : pc[b == 0 ? 0 : b - 1]),
+      .ACIN(30'd0), .BCIN(18'd0), .PCIN(g == 0 ? 48'd0 : pc[g == 0 ? 0 : g - 1]),
       .CARRYCASCIN(1'b0), .MULTSIGNIN(1'b0),
-      .ACOUT(), .BCOUT(), .PCOUT(pc[b]), .P(pf[b]), .CARRYCASCOUT(), .MULTSIGNOUT(),
+      .ACOUT(), .BCOUT(), .PCOUT(pc[g]), .P(pf[g]), .CARRYCASCOUT(), .MULTSIGNOUT(),
       .CARRYOUT(), .OVERFLOW(), .UNDERFLOW(), .PATTERNDETECT(), .PATTERNBDETECT(), .XOROUT());
   end
-  assign s = $signed(pf[3][SW-1:0]);
+  // the accumulator: X = P (0 for a row's first block), Y = 0, Z = PCIN
+  DSP48E2 #(
+    .A_INPUT("DIRECT"), .B_INPUT("DIRECT"), .AMULTSEL("A"), .BMULTSEL("B"), .PREADDINSEL("A"),
+    .USE_MULT("NONE"), .USE_WIDEXOR("FALSE"),
+    .USE_SIMD("ONE48"), .AREG(0), .ACASCREG(0), .BREG(0), .BCASCREG(0), .CREG(0), .DREG(0),
+    .ADREG(0), .MREG(0), .PREG(1), .INMODEREG(0), .OPMODEREG(1), .ALUMODEREG(0),
+    .CARRYINREG(0), .CARRYINSELREG(0), .USE_PATTERN_DETECT("NO_PATDET"),
+    .AUTORESET_PATDET("NO_RESET"), .MASK(48'h3fffffffffff), .PATTERN(48'h0),
+    .SEL_MASK("MASK"), .SEL_PATTERN("PATTERN")
+  ) u_acc (
+    .CLK(clk),
+    .A(30'd0), .B(18'd0), .C(48'd0), .D(27'd0),
+    .INMODE(5'b00000), .OPMODE(first ? 9'b00_001_00_00 : 9'b00_001_00_10),
+    .ALUMODE(4'b0000), .CARRYIN(1'b0), .CARRYINSEL(3'b000),
+    .CEA1(1'b0), .CEA2(1'b0), .CEB1(1'b0), .CEB2(1'b0), .CEC(1'b0), .CED(1'b0), .CEAD(1'b0),
+    .CEM(1'b0), .CEP(1'b1), .CEALUMODE(1'b0), .CECTRL(1'b1), .CECARRYIN(1'b0),
+    .CEINMODE(1'b0),
+    .RSTA(1'b0), .RSTB(1'b0), .RSTC(1'b0), .RSTD(1'b0), .RSTM(1'b0), .RSTP(1'b0),
+    .RSTALLCARRYIN(1'b0), .RSTALUMODE(1'b0), .RSTCTRL(1'b0), .RSTINMODE(1'b0),
+    .ACIN(30'd0), .BCIN(18'd0), .PCIN(pc[7]), .CARRYCASCIN(1'b0), .MULTSIGNIN(1'b0),
+    .ACOUT(), .BCOUT(), .PCOUT(pc[8]), .P(pf[8]), .CARRYCASCOUT(), .MULTSIGNOUT(),
+    .CARRYOUT(), .OVERFLOW(), .UNDERFLOW(), .PATTERNDETECT(), .PATTERNBDETECT(), .XOROUT());
+  assign acc = pf[8];
 endmodule

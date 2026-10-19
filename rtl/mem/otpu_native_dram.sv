@@ -75,12 +75,13 @@
 //   commands before it read the old beat, the ones after it the new. The drop lands at the end
 //   of the cycle after the write goes out. An A read taken before then may still take the old
 //   beat; it does not depend on the write: the slice waits for wr_idle, which is high in that
-//   cycle at the earliest, and an A request then waits a cycle in the A register (a_v). An A
+//   cycle at the earliest, and an A request then waits a cycle in its port A register. An A
 //   write also drops them when it is taken: the A reads after it in the A queue would otherwise
 //   take a beat fetched before it. So the QSTs that stream while an MM runs, and DSTEP's state
 //   write-back, cost the MXU's scale stream no runs.
 // - wr_idle: every accepted write has gone out and is counted in n_wdone.
-// - rd_idle: every A and B read taken (and an A read in the A register) has returned its data.
+// - rd_idle: every A and B read taken has returned its data (a read still in one of the slice's
+//   port registers is the slice's: otpu_slice, otpu_board).
 //   This adapter does not reset with the run (the board's RUN), so a run the host stops leaves
 //   its reads to come back after it: the loader and the next run wait for rd_idle (otpu_slice,
 //   otpu_board). An A run's beats not asked for are not in it (the next miss drops them).
@@ -117,8 +118,7 @@ module otpu_native_dram #(
   input  logic [31:0]       a_wdata_x,
   input  logic [3:0]        a_be_x,
   output logic              a_rvalid,
-  output logic [31:0]       a_rdata,
-  output logic [31:0]       a_rdata2,   // the word at a_addr ^ 1 (the other half of its 8-byte pair)
+  output logic [255:0]      a_rdata,    // the aligned 32 bytes holding word a_addr (half a beat)
   output logic              sw_rdy,
   input  logic              sw_req,
   input  logic [31:0]       sw_addr,    // word address
@@ -270,24 +270,17 @@ module otpu_native_dram #(
   logic [25:0]  al_beat;
 
   assign b_rdy = (qb_n[0] < QD) && (qb_n[1] < QD) && (bt_n < OD);
-  // Port A requests are registered on the way in (a_v and the a_* copies): the slice's grant
-  // chain (DMA busy -> port arbitration -> the MXU's issue -> the scale address) does not run on
-  // into the channel hash, the run compare and the queue writes in one cycle. The register takes
-  // a request when it is empty or its request is taken.
-  logic        a_v, a_req, a_we, a_rdy;
+  // Port A's requests come from the slice's port A register (otpu_slice; this adapter's own, on
+  // the way in, until it moved there): the slice's grant chain (DMA busy -> port arbitration ->
+  // the MXU's issue -> the scale address) does not run on into the channel hash, the run compare
+  // and the queue writes in one cycle.
+  logic        a_req, a_we, a_rdy;
   logic [31:0] a_addr, a_wdata;
   logic [3:0]  a_be;
-  assign a_req = a_v;
+  assign a_req = a_req_x; assign a_we = a_we_x; assign a_addr = a_addr_x;
+  assign a_wdata = a_wdata_x; assign a_be = a_be_x;
   assign a_rdy = (qa_n[0] < QD) && (qa_n[1] < QD) && (ao_n < OD);
-  assign a_rdy_x = !a_v || a_rdy;
-  always_ff @(posedge clk) begin
-    if (rst) a_v <= 1'b0;
-    else if (a_req_x && a_rdy_x) a_v <= 1'b1;
-    else if (a_rdy) a_v <= 1'b0;
-    if (a_req_x && a_rdy_x) begin
-      a_we <= a_we_x; a_addr <= a_addr_x; a_wdata <= a_wdata_x; a_be <= a_be_x;
-    end
-  end
+  assign a_rdy_x = a_rdy;
   assign sw_rdy = (qw_n[0] < WQD) && (qw_n[1] < WQD);
   wire sw_take = sw_req && sw_rdy;
   wire sw_ch = chan_of(sw_addr);
@@ -539,8 +532,7 @@ module otpu_native_dram #(
   // MXU's scale FIFO block RAM in one cycle)
   always_ff @(posedge clk) begin
     a_rvalid <= !rst && a_out;
-    a_rdata <= a_src[32 * aoh.idx +: 32];
-    a_rdata2 <= a_src[32 * (aoh.idx ^ 4'd1) +: 32];
+    a_rdata <= a_src[256 * aoh.idx[3] +: 256];
   end
 
   // the tag FIFO writes its tail every cycle too (the slot is not live unless the FIFO is full),
@@ -561,9 +553,9 @@ module otpu_native_dram #(
   logic [PW-1:0] wq_n;
   logic [4:0]    wacc_q;
   logic [15:0]   iss_w [2];
-  assign wr_idle = (wq_n == 0) && (wacc_q == '0) && (gv == '0) && !(a_v && a_we) &&
+  assign wr_idle = (wq_n == 0) && (wacc_q == '0) && (gv == '0) &&
                    (iss_w[0] == n_wdone[0]) && (iss_w[1] == n_wdone[1]);
-  assign rd_idle = (bt_n == 0) && (ao_n == 0) && !(a_v && !a_we);
+  assign rd_idle = (bt_n == 0) && (ao_n == 0);
 
   always_ff @(posedge clk) begin
     if (rst) begin
