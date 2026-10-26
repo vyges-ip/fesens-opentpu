@@ -156,6 +156,36 @@ module otpu_ram_1r1w #(
     .clk, .we, .wm('1), .wa, .wd, .re, .ra, .rd);
 endmodule
 
+// Read ahead (rtl/tech/generic has the contract): small and asynchronous-read, so flip-flops and
+// a read multiplexer at the registered address, as the units' LUT RAMs were; no macro.
+module otpu_ram_1r1w_ra #(
+  parameter int    W     = 32,
+  parameter int    N     = 64,
+  parameter string STYLE = "block",
+  parameter bit    ZERO  = 1'b1
+) (
+  input  logic                 clk,
+  input  logic                 we,
+  input  logic [$clog2(N)-1:0] wa,
+  input  logic [W-1:0]         wd,
+  input  logic [$clog2(N)-1:0] ra_n,
+  output logic [W-1:0]         rd
+);
+  logic [W-1:0]         mem [N];
+  logic [$clog2(N)-1:0] ra;
+  always_ff @(posedge clk) begin
+    if (we) mem[wa] <= wd;
+    ra <= ra_n;
+  end
+  assign rd = mem[ra];
+`ifndef SYNTHESIS
+  initial begin
+    ra = '0;
+    if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
+  end
+`endif
+endmodule
+
 module otpu_ram_1r1w_be #(
   parameter int    W     = 64,
   parameter int    N     = 1024,

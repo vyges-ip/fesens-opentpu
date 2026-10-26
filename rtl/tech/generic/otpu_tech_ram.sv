@@ -56,6 +56,57 @@ module otpu_ram_1r1w #(
   end
 endmodule
 
+// One read port and one write port, read ahead: rd is the word at the read address register (ra,
+// ra_n's value of the last cycle) with every write up to the last edge in it, as a LUT RAM's
+// asynchronous read of a registered address gives it, for the cycle-exact place of such a RAM.
+// The user gives the address's next value (ra_n) a cycle early; the block RAM reads it at the
+// edge, and the word written at that same edge (which its read misses) comes from a register (the
+// bypass: wd and its hit, registered). A wide LUT RAM puts each address bit on every 6 data bits'
+// cells (the card's DMA gather: ~6,500 pins a bit); here on one block RAM per 36 or 72 bits.
+module otpu_ram_1r1w_ra #(
+  parameter int    W     = 32,
+  parameter int    N     = 64,
+  parameter string STYLE = "block",
+  parameter bit    ZERO  = 1'b1
+) (
+  input  logic                 clk,
+  input  logic                 we,
+  input  logic [$clog2(N)-1:0] wa,
+  input  logic [W-1:0]         wd,
+  input  logic [$clog2(N)-1:0] ra_n,
+  output logic [W-1:0]         rd
+);
+  logic [W-1:0] q, wq;
+  logic         by;
+  if (STYLE == "distributed") begin : g_lut
+    (* ram_style = "distributed" *) logic [W-1:0] mem [N];
+    always_ff @(posedge clk) begin
+      if (we) mem[wa] <= wd;
+      q <= mem[ra_n];
+    end
+`ifndef SYNTHESIS
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
+`endif
+  end else begin : g_bram
+    (* ram_style = "block" *) logic [W-1:0] mem [N];
+    always_ff @(posedge clk) begin
+      if (we) mem[wa] <= wd;
+      q <= mem[ra_n];
+    end
+`ifndef SYNTHESIS
+    initial if (ZERO) for (int i = 0; i < N; i++) mem[i] = '0;
+`endif
+  end
+  always_ff @(posedge clk) begin
+    by <= we && wa == ra_n;
+    wq <= wd;
+  end
+  assign rd = by ? wq : q;
+`ifndef SYNTHESIS
+  initial begin q = '0; wq = '0; by = 1'b0; end
+`endif
+endmodule
+
 // One read port and one write port with byte enables (wbe[k]: write byte k of wd).
 module otpu_ram_1r1w_be #(
   parameter int    W     = 64,           // a multiple of 8

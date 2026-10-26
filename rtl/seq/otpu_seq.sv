@@ -584,6 +584,11 @@ module otpu_seq
   logic [VN-1:0]    vpend [WIN];              // a slot's VPU producers still outstanding
   logic [VIW-1:0]   vix [WIN];                // a VPU slot's index mod VN
   logic [VN-1:0]    v_fin;                    // the VPU's completion this cycle (index mod VN)
+  // vout at the next VPU instruction's index VMW back (wd_n + 1 mod VN), a flip-flop loaded with
+  // its next value (vout's, at wd_n's next): wc_hold, so the dispatch (c_go -> P -> R's advance
+  // -> the loop counters' enables, pc) starts at it, not at a 32:1 select of vout by wd_n (the m8
+  // card at 150 MHz: vout -> wc_hold -> c_go -> stk_rem's enables, 9 levels, -0.063 ns)
+  logic             vnx_q;
   logic [CW-1:0]    wt [WIN][NWT];
   logic [NWT-1:0]   wv [WIN];
   logic [WIN-1:0]   w_all, w_dram;            // the slot's waits (all / the stream's) are met
@@ -619,7 +624,7 @@ module otpu_seq
   always_comb begin
     v_fin = '0;
     if (udone[U_VPU]) v_fin[vix[uq[U_VPU][uq_h[U_VPU][SW-1:0]]]] = 1'b1;
-    wc_hold = WAITC && c_unit == U_VPU && vout[VIW'(wd_n[U_VPU] + 1'b1)];
+    wc_hold = WAITC && c_unit == U_VPU && vnx_q;
 `ifndef SYNTHESIS
     if (wc_vg != VMW) begin
       wc_hold = 1'b0;
@@ -629,6 +634,14 @@ module otpu_seq
     end
 `endif
   end
+`ifndef SYNTHESIS
+  bit vnx_seen;                                // a reset seen (registers start arbitrary)
+  initial vnx_seen = 1'b0;
+  always @(posedge clk) if (rst) vnx_seen <= 1'b1;
+  always @(posedge clk)
+    if (WAITC && !rst && vnx_seen && vnx_q != vout[VIW'(wd_n[U_VPU] + 1'b1)])
+      $fatal(1, "otpu_seq: vnx_q %0d is not vout[%0d]", vnx_q, VIW'(wd_n[U_VPU] + 1'b1));
+`endif
   always_comb
     for (int i = 0; i < WIN; i++) begin
       logic [NWT-1:0] ok;
@@ -813,26 +826,50 @@ module otpu_seq
   // The command store is one distributed RAM per unit (1 write, 1 asynchronous read, no reset):
   // a single read port each, so it infers as LUT-RAM and trims the fields its unit never reads
   // (as do the registers).
-  // The collective's copy loads on every cycle the collective is ready and not starting (urdy:
-  // no request pending, a flip-flop in otpu_slice), which covers its starts, and the collective
-  // reads its command only while its request is pending: the enable is two flip-flops, not the
-  // start decode (133.33 MHz, 812bb01: sstarted -> the collective's can_start -> its copy's
-  // enable, fanout 120, 7 levels, +0.165 ns)
+  // Each copy loads on every cycle its unit is ready and not starting (urdy, ustart), which covers
+  // its starts: the enable is the unit's rdy and a flip-flop, not the start decode (133.33 MHz,
+  // 812bb01: sstarted -> the collective's can_start -> its copy's enable, fanout 120, 7 levels,
+  // +0.165 ns; the m8 card at a 150 MHz equivalent, unit 2's, 216 loads, -0.028). The units read
+  // their command only at ustart (the DMA, the MXU, the quantizer and the VPU copy it then; the
+  // MXU's release reads none), when the copy holds (ustart is up), and the collective only while
+  // its request is pending (urdy low). Between starts the copy follows start_slot, unread.
+  // WAITC: the store is written a cycle after the dispatch, from flip-flops: the enable and the
+  // slot a copy per unit (kept), the command one register. A slot starts two cycles after its
+  // dispatch at the earliest (w_all_q, w_dram_q), so its command is in the store by then. The
+  // dispatch decision and the free slot then end at a few flip-flops instead of every store's
+  // write port (r22's m8 at 150 MHz: sv -> the free slot -> the LUT RAMs' write addresses, 3036
+  // pins, -0.49 ns; vout -> c_go -> their write enables, 868, -0.34)
+  cmd_t c_cmd_w;
+  always_ff @(posedge clk) c_cmd_w <= c_cmd;
   logic [SW-1:0] ucs [NUNITS];
   for (genvar u = 0; u < NUNITS; u++) begin : g_cmd
     (* ram_style = "distributed" *) logic [$bits(cmd_t)-1:0] m [WIN];
     logic [$bits(cmd_t)-1:0] q;
-    wire q_en = (u == U_COLL) ? urdy[u] && !ustart[u] : can_start[u];
-    always_ff @(posedge clk) if (!rst && c_go) m[free_slot] <= c_cmd;
+    logic          we;
+    logic [SW-1:0] wa;
+    wire q_en = urdy[u] && !ustart[u];
+    if (WAITC) begin : g_wq
+      (* keep_hierarchy = "yes" *)
+      otpu_delay #(.W(1 + SW), .N(1)) u_w (.clk, .en(1'b1), .d({!rst && c_go, free_slot}),
+                                          .q({we, wa}));
+    end else begin : g_wd
+      assign we = !rst && c_go;
+      assign wa = free_slot;
+    end
+    always_ff @(posedge clk) if (we) m[wa] <= WAITC ? c_cmd_w : c_cmd;
     always_ff @(posedge clk) if (!rst && q_en) q <= m[start_slot[u]];
     assign ucmd[u] = cmd_t'(q);
 `ifndef SYNTHESIS
-    // the copy is the started slot's command while the slot is in the window
+    // the copy is the started slot's command when the unit reads it (at ustart; the collective
+    // while its request is pending); no start reads a slot whose write is still on its way
     always @(posedge clk) begin
-      if (!rst && sv[ucs[u]] && sstarted[ucs[u]] && soh[ucs[u]][u] && q != m[ucs[u]])
+      if (!rst && (ustart[u] || (u == U_COLL && !urdy[u])) && sv[ucs[u]] && sstarted[ucs[u]]
+          && soh[ucs[u]][u] && q != m[ucs[u]])
         $fatal(1, "otpu_seq: unit %0d's command is not slot %0d's", u, ucs[u]);
       if (!rst && can_start[u] && !q_en)
         $fatal(1, "otpu_seq: unit %0d starts without loading its command", u);
+      if (WAITC && !rst && we && can_start[u] && start_slot[u] == wa)
+        $fatal(1, "otpu_seq: unit %0d starts slot %0d before its command is written", u, wa);
     end
 `endif
   end
@@ -875,6 +912,7 @@ module otpu_seq
       for (int u = 0; u < NUNITS; u++) begin uq_h[u] <= '0; uq_t[u] <= '0; end
       for (int u = 0; u < NUNITS; u++) begin wd_n[u] <= '0; wc_n[u] <= '0; end
       vout <= '0;
+      vnx_q <= 1'b0;
       for (int i = 0; i < WIN; i++) sdep[i] <= '0;
 `ifndef SYNTHESIS
       sdone <= '0;
@@ -992,6 +1030,13 @@ module otpu_seq
         for (int u = 0; u < NUNITS; u++) if (udone[u] && u != U_VPU) wc_n[u] <= wc_n[u] + 1'b1;
         vout <= (vout & ~v_fin) |
                 ((c_go && c_unit == U_VPU) ? VN'(1) << wd_n[U_VPU][VIW-1:0] : '0);
+        // (a VPU dispatch sets bit wd_n and moves wd_n on: the next index's bit is wd_n + 2's)
+        begin
+          logic [VIW-1:0] i1, i2;
+          i1 = VIW'(wd_n[U_VPU] + 1'b1);
+          i2 = VIW'(wd_n[U_VPU] + 2'd2);
+          vnx_q <= (c_go && c_unit == U_VPU) ? vout[i2] && !v_fin[i2] : vout[i1] && !v_fin[i1];
+        end
         for (int i = 0; i < WIN; i++) vpend[i] <= vpend[i] & ~v_fin;
       end
       // readiness (for the profiler: when did the dependencies clear)

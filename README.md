@@ -173,6 +173,34 @@ with a roofline, a timeline and per-instruction tables ([docs/lens.md](docs/lens
 *Lens replaying part of a Qwen3 decode step. Colours show what each unit is doing in each
 cycle: busy, waiting on DRAM, or waiting on another instruction.*
 
+## ASIC flow
+
+Besides the FPGA card, openTPU also builds as a chip layout: an ASIC block on the open NanGate45
+(45 nm) cell library, with 33 SRAM macros and ~560k standard cells. It is built end-to-end by AI
+agents, from the SystemVerilog source to a routed layout, on open-source tools only: Yosys for
+synthesis, OpenROAD for place and route, and [OpenLayout](https://github.com/fenggev56/OpenLayout)'s
+agent skills for the physical-design decisions.
+
+```
+RTL → synthesis → floorplan → macro placement → place / CTS / route → timing (STA)
+ ↑                           (OpenLayout agents)   (timing repair)          │
+ └──────────── change the RTL, verify it bit-exact ←────────────────────────┘
+```
+
+**What each step does**
+
+- **Synthesis** turns the RTL into a netlist of library cells; the SRAMs stay as hard macros.
+- **Macro placement** decides where the 33 large SRAM blocks sit on the die. Every wire after it
+  depends on that choice, so it decides whether the chip routes and how fast it runs. AI placer can beat all the traditional algorithms.
+- **Place / CTS / route** places the standard cells, builds the clock tree and draws the wires,
+  repairing timing (buffers, resizing) along the way.
+- **STA** (static timing analysis) reports the routed layout's slowest paths and by how much they
+  miss the clock.
+
+**Use it on your own design.** [docs/asic_timing_loop.md](docs/asic_timing_loop.md) describes the
+loop step by step, includes a ready-to-fill prompt that hands the whole loop to a coding agent (any
+design, any node), and records the openTPU run and the pitfalls met on the way.
+
 ## Try it
 
 Everything except the card runs on a laptop.
@@ -314,6 +342,8 @@ the card went from 0.052 (build 84989047, before K smoothing) to 0.012.
 2. [`opentpu/kernels`](opentpu/kernels) and [docs/compiler.md](docs/compiler.md): how a kernel
    becomes instructions.
 3. [`opentpu/isasim.py`](opentpu/isasim.py): the simulator, which is the spec.
+   [docs/bend.md](docs/bend.md): the same simulator in Bend, with laws about its arithmetic
+   and 10-15x isasim's speed.
 4. [`rtl/`](rtl): the hardware, starting from [`rtl/top/otpu_top.sv`](rtl/top/otpu_top.sv).
 5. [docs/lfm2.md](docs/lfm2.md), [docs/qwen35.md](docs/qwen35.md), [docs/llama.md](docs/llama.md),
    [docs/benchmarks.md](docs/benchmarks.md): whole models and where their cycles go.

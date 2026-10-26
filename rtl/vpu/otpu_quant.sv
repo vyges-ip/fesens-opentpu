@@ -131,6 +131,7 @@ module otpu_quant
 #(
   parameter int D     = 32,
   parameter int LANES = 8,
+  parameter int TLANES = LANES,             // TMEM's banks (t_rben; at least LANES)
   parameter int GR    = 1024,               // group maxes of a row (QACT 4*KB, QST KB; not ROW)
   parameter int XD    = 1024,               // row buffer chunks (QACT rows <= XD*LANES); 0: none
   parameter int SID   = 0
@@ -148,6 +149,10 @@ module otpu_quant
   input  logic [LANES-1:0][31:0]  t_rdata,
   output logic [LANES-1:0]        t_ren2,
   output logic [LANES-1:0][31:0]  t_raddr2,
+  // t_ren / t_ren2 by TMEM bank (TLANES banks; otpu_tmem PBR: the ports' rotator merge,
+  // registered with them)
+  output logic [TLANES-1:0]       t_rben, t_rben2,
+  output logic [TLANES-1:0][31:0] t_rbad, t_rbad2,
   input  logic [LANES-1:0][31:0]  t_rdata2,
   output logic                    t_ren3,     // RSCALE: the row factor (one word)
   output logic [31:0]             t_raddr3,
@@ -275,15 +280,25 @@ module otpu_quant
   // to TMEM from flip-flops, a cycle after they are formed, advancing with the enable; the
   // position's arithmetic (row_src + e + l, csb + e + l, rsb + r) and the issue test end at the
   // register, not at the TMEM's ranks and pumped banks. The chunk waits a cycle in m0a for it.
-  logic [LANES-1:0]       t_ren_c, t_ren2_c;
-  logic [LANES-1:0][31:0] t_raddr_c, t_raddr2_c;
-  logic                   t_ren3_c;
-  logic [31:0]            t_raddr3_c;
+  // The requests by TMEM bank too (t_rben*, otpu_tmem PBR), so TMEM's ranks and compares start at
+  // flip-flops, not at its rotation of the lanes (r150d, the m8 card at a real 150 MHz:
+  // t_raddr -> the rotation -> the ranks -> a pumped bank's address, 6 levels)
+  logic [LANES-1:0]        t_ren_c, t_ren2_c;
+  logic [LANES-1:0][31:0]  t_raddr_c, t_raddr2_c;
+  logic [TLANES-1:0]       t_rben_c, t_rben2_c;
+  logic [TLANES-1:0][31:0] t_rbad_c, t_rbad2_c;
+  logic                    t_ren3_c;
+  logic [31:0]             t_raddr3_c;
+  otpu_tmem_breq #(.LANES(LANES), .TLANES(TLANES)) u_tb1 (.en(t_ren_c), .a0(t_raddr_c[0]),
+                                                          .ben(t_rben_c), .bad(t_rbad_c));
+  otpu_tmem_breq #(.LANES(LANES), .TLANES(TLANES)) u_tb2 (.en(t_ren2_c), .a0(t_raddr2_c[0]),
+                                                          .ben(t_rben2_c), .bad(t_rbad2_c));
   always_ff @(posedge clk)
-    if (rst) begin t_ren <= '0; t_ren2 <= '0; t_ren3 <= 1'b0; end
+    if (rst) begin t_ren <= '0; t_ren2 <= '0; t_ren3 <= 1'b0; t_rben <= '0; t_rben2 <= '0; end
     else if (en) begin
       t_ren <= t_ren_c; t_ren2 <= t_ren2_c; t_ren3 <= t_ren3_c;
       t_raddr <= t_raddr_c; t_raddr2 <= t_raddr2_c; t_raddr3 <= t_raddr3_c;
+      t_rben <= t_rben_c; t_rben2 <= t_rben2_c; t_rbad <= t_rbad_c; t_rbad2 <= t_rbad2_c;
     end
   // (the addresses follow the position alone: a lane's counts only while its enable is up)
   always_comb begin
@@ -433,13 +448,32 @@ module otpu_quant
   logic [NB-1:0] sv;
 
   // ------------------------------------------------------------------ pass 1: offsets
-  // d = min(31, e(amax) - e(a) - (f(a) > f(amax))), 0 for a = 0 and in ROW mode (a <= amax)
+  // d = min(31, e(amax) - e(a) - (f(a) > f(amax))), 0 for a = 0 and in ROW mode (a <= amax).
+  // A carry select: e(amax) - e(a) and e(amax) - e(a) - 1 (+ ~e(a)) beside the fraction compare,
+  // which picks one, saturated (the compare was the subtract's operand: the group RAMs' output,
+  // the compare's and the subtract's carry chains and the saturation in series, 9 levels, the
+  // m8 card at a 150 MHz equivalent -0.026 ns)
   function automatic logic [4:0] dval(input logic [30:0] a, input f32_t amax, input logic row);
+    logic [8:0] d0, d1;
+    if (row || a == 0) return 5'd0;
+    d0 = 9'(amax[30:23]) - 9'(a[30:23]);
+    d1 = 9'(amax[30:23]) + {1'b1, ~a[30:23]};
+    if (a[22:0] > amax[22:0]) return (d1[8:5] != 0) ? 5'd31 : d1[4:0];
+    return (d0[8:5] != 0) ? 5'd31 : d0[4:0];
+  endfunction
+`ifndef SYNTHESIS
+  function automatic logic [4:0] dval_ref(input logic [30:0] a, input f32_t amax, input logic row);
     logic [8:0] d;
     if (row || a == 0) return 5'd0;
     d = 9'(amax[30:23]) - 9'(a[30:23]) - ((a[22:0] > amax[22:0]) ? 9'd1 : 9'd0);
     return (d > 9'd31) ? 5'd31 : d[4:0];
   endfunction
+  always @(posedge clk) if (!rst && en)
+    for (int s = 0; s < 4; s++)
+      if (dval(bm ? grd[s] : grd_d[s], amx_q[m1s.row[1:0]], rowm)
+          != dval_ref(bm ? grd[s] : grd_d[s], amx_q[m1s.row[1:0]], rowm))
+        $fatal(1, "otpu_quant: dval is not the reference's");
+`endif
   // inv * 2^d: inv is +0, +inf or positive and normal (otpu_qscale), so the product is exact:
   // the exponent field plus d, +inf where it reaches 255
   function automatic f32_t p2mul(input f32_t inv, input logic [4:0] d);

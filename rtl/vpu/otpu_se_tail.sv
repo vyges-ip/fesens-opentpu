@@ -48,7 +48,7 @@ module otpu_se_tail
   input  ss_cfg_t          cfg,         // valid from before the fill to the stream's last o
   // fill (the DMA's TMEM reads): a vector segment at index fi, a row scalar segment, K0, K1
   input  logic [2:0]       fk,          // SF_*
-  input  logic [4:0]       fi,
+  input  logic [4:0]       fi [LANES],  // the segment's index, a copy per lane (the VPU's g_sfi)
   input  f32_t             fd [LANES],
   // stream
   input  logic             pe,
@@ -75,10 +75,11 @@ module otpu_se_tail
   // (u_sel / q_sel) to u_y / q_y. Their units advance on cen (the VPU's enable, which is pe in
   // stream mode) (docs/stream.md 11.2). VOP mode comes as copies of one bit, two per lane (cm_u:
   // U's operand registers, cm_q: Q's multiplier operands and partial loop), each its own
-  // flip-flop in otpu_vpu, so no one net reaches every lane's selects
+  // flip-flop in otpu_vpu, so no one net reaches every lane's selects; the enable too (cen: a
+  // copy per lane, the VPU's en_l)
   input  logic [LANES-1:0] cm_u,
   input  logic [LANES-1:0] cm_q,
-  input  logic             cen,
+  input  logic [LANES-1:0] cen,
   input  logic             u_sel,
   input  f32_t             u_a [LANES],
   input  f32_t             u_b [LANES],
@@ -156,11 +157,11 @@ module otpu_se_tail
   for (genvar l = 0; l < L; l++) begin : g_buf
     f32_t kb [CBD], kb2 [CBD], qb [CBD], vb [CBD], gb [CBD];
     always_ff @(posedge clk) begin
-      if (fa) kb[fi] <= fd[l];
-      if (fk == SF_K) kb2[fi] <= fd[l];
-      if (fk == SF_Q) qb[fi] <= fd[l];
-      if (fk == SF_X) vb[fi] <= fd[l];
-      if (fk == SF_G) gb[fi] <= fd[l];
+      if (fa) kb[fi[l]] <= fd[l];
+      if (fk == SF_K) kb2[fi[l]] <= fd[l];
+      if (fk == SF_Q) qb[fi[l]] <= fd[l];
+      if (fk == SF_X) vb[fi[l]] <= fd[l];
+      if (fk == SF_G) gb[fi[l]] <= fd[l];
     end
     // pad64: the columns past 64 (segments 8..15) read +0
     assign kx[l] = (c_pad && xj[CBW-1:3] != '0) ? F_ZERO : kb[xj];
@@ -295,11 +296,10 @@ module otpu_se_tail
   f32_t  nw [L];
   ss_meta_t um_y;
   wire   upad = c_pad && um.j[4:3] != '0;
-  // U's and Q's units: on cen, with the composite's operands in VOP mode
-  wire   ue = cen;
+  // U's and Q's units: on cen (lane l's copy), with the composite's operands in VOP mode
   for (genvar l = 0; l < L; l++) begin : g_u
     f32_t ra, rg, rc, re;
-    always_ff @(posedge clk) if (ue) begin
+    always_ff @(posedge clk) if (cen[l]) begin
       if (cm_u[l]) begin
         ra <= u_a[l]; rg <= u_b[l]; rc <= u_c[l]; re <= u_e[l];
       end else begin
@@ -307,7 +307,7 @@ module otpu_se_tail
         re <= ku[l];
       end
     end
-    otpu_fmma #(.LM(LM), .LA(LA)) u_ma (.clk, .en(ue), .a(ra), .b(rg), .c(rc), .e(re), .y(nw[l]));
+    otpu_fmma #(.LM(LM), .LA(LA)) u_ma (.clk, .en(cen[l]), .a(ra), .b(rg), .c(rc), .e(re), .y(nw[l]));
     assign u_y[l] = nw[l];
   end
   otpu_delay #(.W($bits(ss_meta_t)), .N(SL)) u_uy (.clk, .en(pe), .d(um), .q(um_y));
@@ -332,16 +332,16 @@ module otpu_se_tail
   // (the partial loop's register) as the product does
   for (genvar l = 0; l < L; l++) begin : g_lq
     f32_t tq, prev, fbd, fbq, qa, qb, qc, qc2, ma, mb;
-    always_ff @(posedge clk) if (ue) begin
+    always_ff @(posedge clk) if (cen[l]) begin
       qa <= q_a[l]; qb <= q_b[l]; qc <= q_c[l]; qc2 <= qc;
     end
     assign ma = cm_q[l] ? qa : nw[l];
     assign mb = cm_q[l] ? qb : qy[l];
-    otpu_fmul #(.LAT(LM)) u_m (.clk, .en(ue), .a(ma), .b(mb), .y(tq));
-    otpu_delay #(.W(32), .N(RL - LA - 1)) u_fb (.clk, .en(ue), .d(pq[l]), .q(fbd));
-    always_ff @(posedge clk) if (ue) fbq <= cm_q[l] ? qc2 : fq_e ? F_ZERO : fbd;
+    otpu_fmul #(.LAT(LM)) u_m (.clk, .en(cen[l]), .a(ma), .b(mb), .y(tq));
+    otpu_delay #(.W(32), .N(RL - LA - 1)) u_fb (.clk, .en(cen[l]), .d(pq[l]), .q(fbd));
+    always_ff @(posedge clk) if (cen[l]) fbq <= cm_q[l] ? qc2 : fq_e ? F_ZERO : fbd;
     assign prev = fbq;
-    otpu_fadd #(.LAT(LA)) u_a (.clk, .en(ue), .a(prev), .b(tq), .y(pq[l]));
+    otpu_fadd #(.LAT(LA)) u_a (.clk, .en(cen[l]), .a(prev), .b(tq), .y(pq[l]));
     assign q_y[l] = pq[l];
   end
   // the final partials to the VPU's tree (in Q's windows, see T_U), the root back

@@ -430,3 +430,36 @@ package otpu_pkg;
     logic [NH-1:0][31:0]     h_v;       // bmxu bdma amxu aq
   } perf_t;
 endpackage
+
+// A rotator port's read by TMEM bank (otpu_tmem PBR), for a unit to register beside its request
+// (here, beside the package, since every unit's source list has this file):
+// the lanes are contiguous words from lane 0's (a0 + l), so bank b is lane (b - rot) mod TLANES's
+// (rot: a0's bank bits) and its word one row on where the lanes wrap (b < rot): otpu_tmem's
+// rotator decode. bad[b] is bank b's word address (its bank bits b).
+module otpu_tmem_breq #(
+  parameter int LANES  = 8,       // the unit's lanes
+  parameter int TLANES = LANES    // TMEM's banks (at least LANES, a power of 2)
+) (
+  input  logic [LANES-1:0]        en,
+  input  logic [31:0]             a0,
+  output logic [TLANES-1:0]       ben,
+  output logic [TLANES-1:0][31:0] bad
+);
+  localparam int BW = (TLANES > 1) ? $clog2(TLANES) : 1;
+  initial if (TLANES < LANES || (1 << $clog2(TLANES)) != TLANES)
+    $fatal(1, "otpu_tmem_breq: TLANES %0d (a power of 2, at least LANES %0d)", TLANES, LANES);
+  wire [BW-1:0] rot = (TLANES > 1) ? a0[BW-1:0] : '0;
+  always_comb begin
+    logic [TLANES-1:0] t;
+    t = '0;
+    ben = '0;
+    ben[LANES-1:0] = en;
+    for (int k = 0; k < BW; k++)
+      if (TLANES > 1 && rot[k]) begin
+        t = ben;
+        for (int l = 0; l < TLANES; l++) ben[(l + (1 << k)) % TLANES] = t[l];
+      end
+    for (int b = 0; b < TLANES; b++)
+      bad[b] = (TLANES > 1) ? (((a0 >> BW) + 32'(BW'(b) < rot)) << BW) | 32'(b) : a0;
+  end
+endmodule

@@ -359,7 +359,7 @@ module otpu_mem_ch #(
   assign xwi_rr   = x_wvalid && x_wready && x_wlast;
   always_ff @(posedge xclk) begin
     if (x_crst) begin
-      x_roff <= '0; x_woff <= '0; x_wlane_r <= '0; x_wfirst <= 1'b1; x_wbuf <= '0; x_wstb <= '0;
+      x_roff <= '0; x_woff <= '0; x_wlane_r <= '0; x_wfirst <= 1'b1; x_wstb <= '0;
       x_wsfull <= '0;
     end else begin
       if (xq_wv && !x_selw) x_roff <= x_rlastb ? '0 : x_roff + 1'b1;
@@ -368,14 +368,24 @@ module otpu_mem_ch #(
         x_wlane_r <= x_wlane + 1'b1;
         if (x_wpush) begin
           x_woff <= x_wlast ? '0 : x_woff + 1'b1;
-          x_wbuf <= '0; x_wstb <= '0; x_wsfull <= '0;
+          x_wstb <= '0; x_wsfull <= '0;
         end else begin
-          x_wbuf <= x_wdata_full; x_wstb <= x_wstb_full;
+          x_wstb <= x_wstb_full;
           x_wsfull[x_wlane] <= &x_wstrb;
         end
       end
     end
   end
+
+  // the lanes' data, neither cleared nor reset: the strobes say which bytes a beat writes (a
+  // partial beat is read-modify-written, its other bytes the memory's). A lane loads while its
+  // beat is offered (the same beat until it is taken; x_wlane's lane holds nothing collected yet:
+  // the beat's lanes come in order, and a new 64-byte beat starts with nothing), so its enable is
+  // x_wvalid and the lane, not the handshake: one LUT from the W channel and the head (the
+  // handshake's push and room cleared or loaded all 580 of x_wbuf / x_wstb / x_wsfull, 3 levels)
+  always_ff @(posedge xclk)
+    for (int l = 0; l < 4; l++)
+      if (x_wvalid && x_wlane == 2'(l)) x_wbuf[l * 128 +: 128] <= x_wdata;
 
   // R: lanes of the returned 64-byte beats
   logic [7:0] x_rcnt;

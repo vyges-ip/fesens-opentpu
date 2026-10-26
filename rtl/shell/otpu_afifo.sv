@@ -24,6 +24,14 @@
 // beat it takes is lost with those already in the FIFO. The RAM's write address is a copy of the
 // write pointer of its own then, replicated by synthesis (MAX_FANOUT) over the RAM's width (the
 // XDMA side at 250 MHz, PCIe Gen2).
+//
+// In order (OOO = 0) the RAM writes the slot at the tail every cycle there is room (wready), and
+// a write only moves the tail: the RAM's write enables come from the pointers' registers (RWR:
+// from wready's flip-flop), not from the writer's valid (on the card the native adapter's write
+// issue, 9 levels from its hazard registers, ran into u_ad's 782 write enables). With room the
+// slot at the tail is free (wused is never under what the read side holds), and the read side
+// reads a slot as valid only once the write pointer, as synchronized, has passed it. (The room
+// is this cycle's wready, not one a cycle older: a write wready takes is always written.)
 module otpu_afifo #(
   parameter int W = 32,
   parameter int DEPTH = 16,
@@ -97,7 +105,7 @@ module otpu_afifo #(
       end
     end
   end
-  always_ff @(posedge wclk) if (wput) mem[waddr] <= wdata;
+  always_ff @(posedge wclk) if (OOO ? wput : wready) mem[waddr] <= wdata;
   if (OOO) begin : g_ooo
     always_ff @(posedge wclk) begin
       if (wrst) wvld <= '0;
